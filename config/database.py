@@ -1,0 +1,81 @@
+"""Database connection and session management."""
+import os
+from typing import Generator, Optional
+from sqlmodel import SQLModel, Session, create_engine
+from contextlib import contextmanager
+
+from .settings import DATABASE_URL, USE_MONGO
+
+# Create engine
+try:
+    connect_args = {"check_same_thread": False} if "sqlite" in DATABASE_URL else {}
+    _engine = create_engine(DATABASE_URL, connect_args=connect_args, echo=False)
+    # Test connection
+    with _engine.connect() as conn:
+        pass
+    engine = _engine
+except Exception as e:
+    print(f"Warning: Failed to connect to {DATABASE_URL}. Falling back to local SQLite.")
+    DATABASE_URL = "sqlite:///./hala.db"
+    connect_args = {"check_same_thread": False}
+    engine = create_engine(DATABASE_URL, connect_args=connect_args, echo=False)
+
+
+# MongoDB connection (optional)
+mongo_db = None
+if USE_MONGO:
+    try:
+        from pymongo import MongoClient
+        mongo_client = MongoClient(os.getenv("MONGO_URL", "mongodb://localhost:27017"))
+        mongo_db = mongo_client["hala_handmade"]
+    except Exception as e:
+        print(f"MongoDB connection failed: {e}")
+        mongo_db = None
+
+
+def upsert_mongo(collection: str, doc: dict, key_field: str = "id"):
+    """Ghi document vào MongoDB nếu kết nối được (dual-write helper)."""
+    if mongo_db is None:
+        return
+    try:
+        key_val = doc.get(key_field)
+        if key_val is None:
+            return
+        mongo_db[collection].replace_one({key_field: key_val}, doc, upsert=True)
+    except Exception as exc:
+        print(f"[Mongo] upsert {collection} failed: {exc}")
+
+
+def delete_mongo(collection: str, key_field: str, key_val):
+    """Xóa document khỏi MongoDB."""
+    if mongo_db is None:
+        return
+    try:
+        mongo_db[collection].delete_one({key_field: key_val})
+    except Exception as exc:
+        print(f"[Mongo] delete {collection} failed: {exc}")
+
+
+def create_db_and_tables():
+    """Create all database tables."""
+    SQLModel.metadata.create_all(engine)
+
+
+def get_session() -> Generator[Session, None, None]:
+    """Get database session dependency."""
+    with Session(engine) as session:
+        yield session
+
+
+@contextmanager
+def get_db_session():
+    """Context manager for database session."""
+    session = Session(engine)
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
