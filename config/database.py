@@ -7,22 +7,13 @@ from contextlib import contextmanager
 from .settings import DATABASE_URL, USE_MONGO
 
 # Create engine
-try:
-    connect_args = {"check_same_thread": False} if "sqlite" in DATABASE_URL else {}
-    _engine = create_engine(DATABASE_URL, connect_args=connect_args, echo=False)
-    # Test connection
-    with _engine.connect() as conn:
-        pass
-    engine = _engine
-except Exception as e:
-    print(f"Warning: Failed to connect to {DATABASE_URL}. Falling back to local SQLite.")
-    DATABASE_URL = "sqlite:///./hala.db"
-    connect_args = {"check_same_thread": False}
-    engine = create_engine(DATABASE_URL, connect_args=connect_args, echo=False)
+connect_args = {"check_same_thread": False} if "sqlite" in DATABASE_URL else {}
+engine = create_engine(DATABASE_URL, connect_args=connect_args, echo=False, pool_pre_ping=True)
 
 
 # MongoDB connection (optional)
 mongo_db = None
+mongo_client = None
 if USE_MONGO:
     try:
         from pymongo import MongoClient
@@ -54,6 +45,15 @@ def delete_mongo(collection: str, key_field: str, key_val):
         mongo_db[collection].delete_one({key_field: key_val})
     except Exception as exc:
         print(f"[Mongo] delete {collection} failed: {exc}")
+
+
+def close_mongo_connection():
+    """Close the optional Mongo client cleanly."""
+    global mongo_client, mongo_db
+    if mongo_client is not None:
+        mongo_client.close()
+        mongo_client = None
+        mongo_db = None
 
 
 def create_db_and_tables():

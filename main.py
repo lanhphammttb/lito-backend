@@ -14,14 +14,14 @@ from fastapi.responses import JSONResponse
 from sqlmodel import Session, SQLModel, select
 
 # Configuration
-from config.settings import settings
-from config.database import engine
+from config.settings import settings, CORS_ORIGINS
+from config.database import engine, close_mongo_connection
 
 # Routers
 from routers.auth import router as auth_router
-from routers.products import router as products_router, public_router as public_products_router, products, product_variants, product_bundles, product_images, product_reviews
+from routers.products import router as products_router, public_router as public_products_router, products, product_variants, product_bundles, product_images, product_reviews, save_variant_sql, save_image_sql, save_review_sql, save_bundle_sql
 from routers.materials import router as materials_router, materials, stock_movements
-from routers.orders import router as orders_router, orders, order_returns, payments, shipping_updates, set_related_stores as set_order_related
+from routers.orders import router as orders_router, orders, order_returns, payments, shipping_updates, set_related_stores as set_order_related, save_return_sql, save_payment_sql
 from routers.customers import router as customers_router, customers, set_customer_orders
 from routers.content import router as content_router, content_plans, demand_signals
 from routers.inventory import router as inventory_router, suppliers, purchase_orders, set_data_stores as set_inventory_stores
@@ -42,12 +42,13 @@ from routers.categories import router as categories_router, categories
 from routers.production import router as production_router, production_jobs
 from routers.expenses import router as expenses_router, expenses, load_expenses
 from routers.cashflow_router import router as cashflow_router, set_data_stores as set_cashflow_stores
+from routers.ai import router as ai_router
 from models.expense import ExpenseTable
 
 # Services
 from services.notification import ws_manager
 from services import fcm as fcm_service
-from services.auth import get_current_user, get_current_user_optional, hash_password
+from services.auth import get_current_user, get_current_user_ws, hash_password
 from services.material import get_low_stock_alerts
 from services.order import compute_order_totals
 import services.product as product_service
@@ -77,6 +78,7 @@ from models.material import StockMovement, MaterialBatchTable, MaterialBatch, Ma
 from models.order import OrderReturn
 from models.inventory import Supplier, PurchaseOrder, PurchaseOrderLine
 from models.issue import Issue as IssueModel
+from utils.datetime import utcnow
 from models.idea import Idea as IdeaModel
 from models.activity import ActivityLog
 from models.experiment import Experiment as ExperimentModel
@@ -165,11 +167,66 @@ def run_schema_migrations():
 
 
 def seed_default_users():
-    """Create default admin users if they don't exist."""
-    default_users = [
-        {"email": "admin@hala.vn", "password": "admin", "name": "Admin", "role": "ADMIN", "is_owner": True},
-        {"email": "owner_a@example.com", "password": "admin", "name": "Owner A", "role": "ADMIN", "is_owner": True},
-    ]
+    """Create bootstrap admin users only when explicitly configured."""
+    default_users = []
+
+    bootstrap_email = os.getenv("BOOTSTRAP_ADMIN_EMAIL", "").strip()
+    bootstrap_password = os.getenv("BOOTSTRAP_ADMIN_PASSWORD", "").strip()
+    if bootstrap_email and bootstrap_password:
+        default_users.append(
+            {
+                "email": bootstrap_email,
+                "password": bootstrap_password,
+                "name": os.getenv("BOOTSTRAP_ADMIN_NAME", "Bootstrap Admin").strip() or "Bootstrap Admin",
+                "role": "ADMIN",
+                "is_owner": True,
+            }
+        )
+
+    owner_a_password = os.getenv("OWNER_A_PASSWORD", "").strip()
+    if owner_a_password:
+        default_users.append(
+            {
+                "email": "owner_a@example.com",
+                "password": owner_a_password,
+                "name": "Owner A",
+                "role": "ADMIN",
+                "is_owner": True,
+            }
+        )
+
+    owner_b_password = os.getenv("OWNER_B_PASSWORD", "").strip()
+    if owner_b_password:
+        default_users.append(
+            {
+                "email": "owner_b@example.com",
+                "password": owner_b_password,
+                "name": "Owner B",
+                "role": "ADMIN",
+                "is_owner": True,
+            }
+        )
+
+    shared_admin_password = os.getenv("ADMIN_DEFAULT_PASSWORD", "").strip()
+    if shared_admin_password:
+        for email, name in (
+            ("owner_a@example.com", "Owner A"),
+            ("owner_b@example.com", "Owner B"),
+        ):
+            if not any(user["email"] == email for user in default_users):
+                default_users.append(
+                    {
+                        "email": email,
+                        "password": shared_admin_password,
+                        "name": name,
+                        "role": "ADMIN",
+                        "is_owner": True,
+                    }
+                )
+
+    if not default_users:
+        print("ℹ No bootstrap admin credentials configured; skipping user seeding.")
+        return
 
     with Session(engine) as session:
         for user_data in default_users:
@@ -181,7 +238,7 @@ def seed_default_users():
                     password_hash=hash_password(user_data["password"]),
                     role=user_data["role"],
                     is_owner=user_data["is_owner"],
-                    created_at=datetime.utcnow(),
+                    created_at=utcnow(),
                 )
                 session.add(new_user)
                 print(f"  📧 Created user: {user_data['email']}")
@@ -744,18 +801,32 @@ def load_data_from_sql():
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
     print("🚀 Starting Hala Handmade Business OS...")
-    create_db_and_tables()
-    run_schema_migrations()
-    seed_default_users()
-    seed_default_data()
-    load_data_from_sql()
-    load_expenses()
-    load_settings_from_db()
-    init_services()
-    print(f"✅ Loaded: products={len(products)}, materials={len(materials)}, orders={len(orders)}, customers={len(customers)}, categories={len(categories)}, suppliers={len(suppliers)}, purchase_orders={len(purchase_orders)}, stock_movements={len(stock_movements)}, content_plans={len(content_plans)}, demand_signals={len(demand_signals)}, experiments={len(experiments)}, goals={len(goals)}, product_images={len(product_images)}, product_reviews={len(product_reviews)}, product_bundles={len(product_bundles)}, issues={len(issues)}, ideas={len(ideas)}, activity_logs={len(activity_logs)}")
-    print("✅ Application ready!")
-    yield
-    print("👋 Shutting down...")
+    auto_init_db = os.getenv("AUTO_INIT_DB_ON_STARTUP", "false").lower() == "true"
+    auto_seed_data = os.getenv("AUTO_SEED_DATA_ON_STARTUP", "false").lower() == "true"
+
+    try:
+        if auto_init_db:
+            create_db_and_tables()
+            run_schema_migrations()
+        else:
+            print("ℹ Skipping automatic DB init/migrations on startup.")
+
+        seed_default_users()
+        if auto_seed_data:
+            seed_default_data()
+        else:
+            print("ℹ Skipping automatic seed data on startup.")
+        load_data_from_sql()
+        load_expenses()
+        load_settings_from_db()
+        init_services()
+        print(f"✅ Loaded: products={len(products)}, materials={len(materials)}, orders={len(orders)}, customers={len(customers)}, categories={len(categories)}, suppliers={len(suppliers)}, purchase_orders={len(purchase_orders)}, stock_movements={len(stock_movements)}, content_plans={len(content_plans)}, demand_signals={len(demand_signals)}, experiments={len(experiments)}, goals={len(goals)}, product_images={len(product_images)}, product_reviews={len(product_reviews)}, product_bundles={len(product_bundles)}, issues={len(issues)}, ideas={len(ideas)}, activity_logs={len(activity_logs)}")
+        print("✅ Application ready!")
+        yield
+    finally:
+        close_mongo_connection()
+        engine.dispose()
+        print("👋 Shutting down...")
 
 
 # ===================== Create FastAPI Application =====================
@@ -769,7 +840,7 @@ app = FastAPI(
 # CORS configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -803,6 +874,7 @@ app.include_router(categories_router, prefix="/categories", tags=["Categories"])
 app.include_router(production_router, prefix="/production-jobs", tags=["Production"])
 app.include_router(expenses_router, prefix="/expenses", tags=["Expenses"])
 app.include_router(cashflow_router, prefix="/cashflow", tags=["CashFlow"])
+app.include_router(ai_router, prefix="/ai", tags=["AI"])
 
 
 # ===================== Root Level API Endpoints =====================
@@ -946,13 +1018,13 @@ async def list_bundles(parent_product_id: int = None, user: User = Depends(get_c
 @app.post("/bundles")
 async def create_bundle(payload: dict, user: User = Depends(get_current_user)):
     """Create product bundle."""
-    new_id = max((b.id for b in product_bundles), default=0) + 1
     bundle = ProductBundle(
-        id=new_id, parent_product_id=payload.get("parent_product_id", payload.get("bundle_product_id")),
+        id=0, parent_product_id=payload.get("parent_product_id", payload.get("bundle_product_id")),
         child_product_id=payload.get("child_product_id"), quantity=payload.get("quantity", 1),
     )
-    product_bundles.append(bundle)
-    return {"id": bundle.id}
+    persisted_bundle = save_bundle_sql(bundle)
+    product_bundles.append(persisted_bundle)
+    return {"id": persisted_bundle.id}
 
 
 @app.get("/reviews")
@@ -968,14 +1040,14 @@ async def list_reviews(product_id: int = None, user: User = Depends(get_current_
 @app.post("/reviews")
 async def create_review(payload: dict, user: User = Depends(get_current_user)):
     """Create product review."""
-    new_id = max((r.id for r in product_reviews), default=0) + 1
     review = ProductReview(
-        id=new_id, product_id=payload.get("product_id"), rating=payload.get("rating", 5),
-        comment=payload.get("comment"), customer_name=payload.get("customer_name", "Khách hàng"),
-        created_at=datetime.utcnow(),
+        id=0, product_id=payload.get("product_id"), rating=payload.get("rating", 5),
+        content=payload.get("content", payload.get("comment")), customer_name=payload.get("customer_name", "Khách hàng"),
+        created_at=utcnow(),
     )
-    product_reviews.append(review)
-    return {"id": review.id}
+    persisted_review = save_review_sql(review)
+    product_reviews.append(persisted_review)
+    return {"id": persisted_review.id}
 
 
 @app.get("/product-images")
@@ -991,13 +1063,13 @@ async def list_product_images(product_id: int = None, user: User = Depends(get_c
 @app.post("/product-images")
 async def create_product_image(payload: dict, user: User = Depends(get_current_user)):
     """Create product image."""
-    new_id = max((img.id for img in product_images), default=0) + 1
     image = ProductImage(
-        id=new_id, product_id=payload.get("product_id"), url=payload.get("url"),
+        id=0, product_id=payload.get("product_id"), url=payload.get("url"),
         is_primary=payload.get("is_primary", False),
     )
-    product_images.append(image)
-    return {"id": image.id}
+    persisted_image = save_image_sql(image)
+    product_images.append(persisted_image)
+    return {"id": persisted_image.id}
 
 
 @app.get("/products/{product_id}/history")
@@ -1017,7 +1089,7 @@ async def get_products_summary(user: User = Depends(get_current_user)):
 async def list_variants(product_id: int = None, user: User = Depends(get_current_user)):
     """List product variants."""
     result = [{"id": v.id, "product_id": v.product_id, "name": v.name, "sku": v.sku,
-               "price_adjustment": v.price_adjustment} for v in product_variants]
+               "price_modifier": v.price_modifier} for v in product_variants]
     if product_id:
         result = [v for v in result if v["product_id"] == product_id]
     return result
@@ -1026,14 +1098,15 @@ async def list_variants(product_id: int = None, user: User = Depends(get_current
 @app.post("/variants")
 async def create_variant(payload: dict, user: User = Depends(get_current_user)):
     """Create product variant."""
-    new_id = max((v.id for v in product_variants), default=0) + 1
     variant = ProductVariant(
-        id=new_id, product_id=payload.get("product_id"), name=payload.get("name"),
-        sku=payload.get("sku"), price_adjustment=payload.get("price_adjustment", 0),
-        attributes=payload.get("attributes", {}),
+        id=0, product_id=payload.get("product_id"), name=payload.get("name"),
+        sku=payload.get("sku"), price_modifier=payload.get("price_modifier", payload.get("price_adjustment", 0)),
+        stock_quantity=payload.get("stock_quantity", 0),
+        is_active=payload.get("is_active", True),
     )
-    product_variants.append(variant)
-    return {"id": variant.id}
+    persisted_variant = save_variant_sql(variant)
+    product_variants.append(persisted_variant)
+    return {"id": persisted_variant.id}
 
 
 @app.put("/variants/{variant_id}")
@@ -1042,9 +1115,10 @@ async def update_variant(variant_id: int, payload: dict, user: User = Depends(ge
     variant = next((v for v in product_variants if v.id == variant_id), None)
     if not variant:
         raise HTTPException(404, "Variant không tồn tại")
-    for key in ["name", "sku", "price_adjustment", "attributes"]:
+    field_aliases = {"price_adjustment": "price_modifier"}
+    for key in ["name", "sku", "price_modifier", "price_adjustment", "stock_quantity", "is_active"]:
         if key in payload:
-            setattr(variant, key, payload[key])
+            setattr(variant, field_aliases.get(key, key), payload[key])
     return {"id": variant.id}
 
 
@@ -1128,13 +1202,13 @@ async def list_returns(order_id: int = None, user: User = Depends(get_current_us
 @app.post("/returns")
 async def create_return(payload: dict, user: User = Depends(get_current_user)):
     """Create order return."""
-    new_id = max((r.id for r in order_returns), default=0) + 1
     ret = OrderReturn(
-        id=new_id, order_id=payload.get("order_id"), reason=payload.get("reason"),
-        status="pending", refund_amount=payload.get("refund_amount", 0), created_at=datetime.utcnow(),
+        id=0, order_id=payload.get("order_id"), reason=payload.get("reason"),
+        status="pending", refund_amount=payload.get("refund_amount", 0), created_by=user.id, created_at=utcnow(),
     )
-    order_returns.append(ret)
-    return {"id": ret.id}
+    persisted_return = save_return_sql(ret)
+    order_returns.append(persisted_return)
+    return {"id": persisted_return.id}
 
 
 # ===================== Payments =====================
@@ -1152,13 +1226,13 @@ async def list_payments(order_id: int = None, user: User = Depends(get_current_u
 async def create_payment(payload: dict, user: User = Depends(get_current_user)):
     """Create payment."""
     from models.order import Payment
-    new_id = max((p.id for p in payments), default=0) + 1
     payment = Payment(
-        id=new_id, order_id=payload.get("order_id"), amount=payload.get("amount"),
-        method=payload.get("method", "cash"), status="completed", created_at=datetime.utcnow(),
+        id=0, order_id=payload.get("order_id"), amount=payload.get("amount"),
+        method=payload.get("method", "cash"), status="completed", paid_date=utcnow(), created_at=utcnow(),
     )
-    payments.append(payment)
-    return {"id": payment.id}
+    persisted_payment = save_payment_sql(payment)
+    payments.append(persisted_payment)
+    return {"id": persisted_payment.id}
 
 
 # ===================== Seasons =====================
@@ -1261,7 +1335,7 @@ async def auto_create_purchase_orders(material_ids: list = Body(...), user: User
             PurchaseOrderLine(material_id=mid, quantity=suggested_qty, unit_price=unit_price)
         )
 
-    now = datetime.utcnow()
+    now = utcnow()
     created = 0
     for supplier_id, lines in groups.items():
         lines_json = _json.dumps([l.model_dump(mode="json") for l in lines])
@@ -1389,7 +1463,7 @@ async def sync_marketplace(payload: dict, user: User = Depends(get_current_user)
         "marketplace": mkt,
         "platform": mkt,
         "status": "completed",
-        "synced_at": datetime.utcnow().isoformat(),
+        "synced_at": utcnow().isoformat(),
         "orders_synced": 0,
         "items_synced": 0,
     }
@@ -1449,7 +1523,7 @@ async def register_fcm_token(payload: dict, user: User = Depends(get_current_use
         ).first()
         if existing:
             existing.user_id = user.id
-            existing.updated_at = datetime.now()
+            existing.updated_at = utcnow()
             session.add(existing)
         else:
             session.add(FcmTokenTable(
@@ -1495,7 +1569,7 @@ async def list_notifications(limit: int = 50, user: User = Depends(get_current_u
 @app.post("/notifications/send")
 async def send_notification(payload: dict, user: User = Depends(get_current_user)):
     """Send notification via WebSocket (online) + FCM (offline/background)."""
-    ts = datetime.now()
+    ts = utcnow()
     title = payload.get("title", "")
     body = payload.get("body", "")
     notification_data = {
@@ -1552,7 +1626,7 @@ async def send_notification(payload: dict, user: User = Depends(get_current_user
 @app.post("/notifications/test")
 async def test_notification(user: User = Depends(get_current_user)):
     """Test notification."""
-    await ws_manager.broadcast({"type": "notification", "title": "Test", "body": "Test notification", "timestamp": datetime.now().isoformat()})
+    await ws_manager.broadcast({"type": "notification", "title": "Test", "body": "Test notification", "timestamp": utcnow().isoformat()})
     return {"success": True, "message": "Test notification sent"}
 
 
@@ -1560,7 +1634,7 @@ async def test_notification(user: User = Depends(get_current_user)):
 @app.post("/backup")
 async def create_backup(user: User = Depends(get_current_user)):
     """Create system backup."""
-    return {"success": True, "backup_id": datetime.utcnow().strftime("%Y%m%d_%H%M%S")}
+    return {"success": True, "backup_id": utcnow().strftime("%Y%m%d_%H%M%S")}
 
 
 # ===================== Orders Summary =====================
@@ -1569,9 +1643,16 @@ async def create_backup(user: User = Depends(get_current_user)):
 
 
 # ===================== WebSocket =====================
-@app.websocket("/ws/{user_id}")
-async def websocket_endpoint(websocket: WebSocket, user_id: int):
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
     """WebSocket for real-time notifications."""
+    try:
+        user = await get_current_user_ws(websocket)
+    except HTTPException:
+        await websocket.close(code=1008)
+        return
+
+    user_id = user.id
     await ws_manager.connect(websocket, user_id)
     try:
         while True:
@@ -1586,7 +1667,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
 @app.get("/health")
 async def health_check():
     """Health check."""
-    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat(), "version": "2.0.0"}
+    return {"status": "healthy", "timestamp": utcnow().isoformat(), "version": "2.0.0"}
 
 
 @app.get("/")

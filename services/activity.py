@@ -1,6 +1,5 @@
 """Activity logging services."""
 from typing import Optional, Dict, Any
-from datetime import datetime
 import json
 from fastapi import Request
 from sqlmodel import Session
@@ -8,6 +7,7 @@ from sqlmodel import Session
 from config.database import engine
 from config.settings import USE_MONGO
 from models.activity import ActivityLog, ActivityLogTable, AuditLogTable
+from utils.datetime import utcnow
 
 # In-memory data stores
 activity_logs = []
@@ -37,7 +37,7 @@ def log_activity(
         entity_id=entity_id,
         action=action,
         changes=changes,
-        created_at=datetime.utcnow(),
+        created_at=utcnow(),
     )
     activity_logs.insert(0, log)
     
@@ -69,7 +69,7 @@ async def create_audit_log(
     request: Request
 ):
     """Create audit log entry for compliance tracking."""
-    now = datetime.utcnow()
+    now = utcnow()
     ip = request.client.host if request.client else None
     user_agent = request.headers.get("user-agent", None)
     user_name = getattr(user, "name", None) or getattr(user, "email", "unknown")
@@ -97,8 +97,8 @@ async def create_audit_log(
             action=action,
             table_name=table_name,
             record_id=record_id,
-            before_data=json.dumps(before_data) if before_data else None,
-            after_data=json.dumps(after_data) if after_data else None,
+            before_data=json.dumps(before_data, default=str) if before_data else None,
+            after_data=json.dumps(after_data, default=str) if after_data else None,
             ip_address=ip,
             user_agent=user_agent,
             timestamp=now

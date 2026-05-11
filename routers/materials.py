@@ -8,7 +8,7 @@ from config.database import engine, upsert_mongo, delete_mongo
 from models.user import User
 from models.material import Material, MaterialTable, StockMovement, StockMovementTable, MaterialBatchTable, MaterialPriceEntry, MaterialPriceEntryTable
 from schemas.material import MaterialCreate, StockMovementCreate
-from services.auth import get_current_user, get_current_user_optional
+from services.auth import get_current_user
 from services.material import find_material, get_low_stock_alerts, save_material_sql
 from services.activity import log_activity, create_audit_log
 from services.product import clear_product_cost_cache
@@ -28,21 +28,30 @@ async def list_materials(
     type: Optional[str] = None,
     search: Optional[str] = None,
     low_stock: bool = False,
-    user: Optional[User] = Depends(get_current_user_optional)
+    user: User = Depends(get_current_user)
 ):
-    """List all materials."""
-    result = materials[:]
-
-    if type:
-        result = [m for m in result if m.type == type]
-    if search:
-        search_lower = search.lower()
-        result = [m for m in result if search_lower in m.name.lower() or search_lower in m.code.lower()]
-    if low_stock:
-        from config.settings import settings
-        result = [m for m in result if m.stock_quantity <= (m.low_threshold or settings.low_stock_threshold)]
-
-    return result[skip:skip + limit]
+    """List all materials from Database."""
+    from sqlmodel import select, or_
+    with Session(engine) as session:
+        statement = select(MaterialTable)
+        if type:
+            statement = statement.where(MaterialTable.type == type)
+        if search:
+            search_pattern = f"%{search}%"
+            statement = statement.where(or_(MaterialTable.name.like(search_pattern), MaterialTable.code.like(search_pattern)))
+            
+        results = session.exec(statement).all()
+        
+        output = []
+        for row in results:
+            m = find_material(row.id)
+            if low_stock:
+                from config.settings import settings
+                if m.stock_quantity > (m.low_threshold or settings.low_stock_threshold):
+                    continue
+            output.append(m)
+            
+        return output[skip:skip + limit]
 
 
 @router.get("/alerts")
@@ -54,7 +63,7 @@ async def material_alerts(user: User = Depends(get_current_user)):
 @router.get("/{material_id}")
 async def get_material(
     material_id: int,
-    user: Optional[User] = Depends(get_current_user_optional)
+    user: User = Depends(get_current_user)
 ):
     """Get single material."""
     return find_material(material_id)
@@ -67,11 +76,10 @@ async def create_material(
     user: User = Depends(get_current_user)
 ):
     """Create new material."""
-    new_id = max((m.id for m in materials), default=0) + 1
     now = datetime.utcnow()
 
     material = Material(
-        id=new_id,
+        id=0,
         code=payload.code,
         name=payload.name,
         type=payload.type,
@@ -88,10 +96,9 @@ async def create_material(
         note=payload.note,
         created_at=now,
     )
-    materials.append(material)
 
     with Session(engine) as session:
-        session.add(MaterialTable(
+        row = MaterialTable(
             code=material.code,
             name=material.name,
             type=material.type,
@@ -107,12 +114,16 @@ async def create_material(
             supplier_id=material.supplier_id,
             note=material.note,
             created_at=material.created_at,
-        ))
+        )
+        session.add(row)
         session.commit()
+        session.refresh(row)
+
+    material.id = row.id
 
     upsert_mongo("materials", material.model_dump(mode="json") if hasattr(material, "model_dump") else material.__dict__)
-    log_activity(user.id, "material", new_id, "create", {"name": material.name})
-    await create_audit_log(user, "CREATE", "materials", new_id, None, material.__dict__, request)
+    log_activity(user.id, "material", material.id, "create", {"name": material.name})
+    await create_audit_log(user, "CREATE", "materials", material.id, None, material.__dict__, request)
     clear_product_cost_cache()
     return material
 
@@ -159,8 +170,6 @@ async def delete_material(
     material = find_material(material_id)
     before_data = material.__dict__.copy()
 
-    materials.remove(material)
-
     # Delete from SQL
     with Session(engine) as session:
         row = session.get(MaterialTable, material_id)
@@ -187,7 +196,11 @@ async def add_stock_movement(
     """Add stock movement (in/out/adjustment)."""
     material = find_material(material_id)
 
-    new_id = max((mv.id for mv in stock_movements), default=0) + 1
+    from sqlmodel import Session, select
+    with Session(engine) as session:
+        max_id_val = session.exec(select(StockMovementTable.id).order_by(StockMovementTable.id.desc())).first()
+        new_id = (max_id_val or 0) + 1
+        
     movement = StockMovement(
         id=new_id,
         material_id=material_id,
@@ -201,7 +214,6 @@ async def add_stock_movement(
         note=payload.note,
         created_at=datetime.utcnow(),
     )
-    stock_movements.append(movement)
 
     # Update material stock
     material.stock_quantity += payload.quantity_change
@@ -240,17 +252,19 @@ async def get_stock_movements(
     limit: int = 100,
     user: User = Depends(get_current_user)
 ):
-    """Get stock movement history for material."""
+    """Get stock movement history for material from Database."""
     find_material(material_id)
-    movements = [mv for mv in stock_movements if mv.material_id == material_id]
-    movements.sort(key=lambda x: x.created_at, reverse=True)
-    return movements[skip:skip + limit]
+    with Session(engine) as session:
+        from sqlmodel import select
+        statement = select(StockMovementTable).where(StockMovementTable.material_id == material_id).order_by(StockMovementTable.created_at.desc()).offset(skip).limit(limit)
+        rows = session.exec(statement).all()
+        return [r.model_dump() for r in rows]
 
 
 @router.get("/{material_id}/batches")
 async def get_material_batches(
     material_id: int,
-    user: Optional[User] = Depends(get_current_user_optional)
+    user: User = Depends(get_current_user)
 ):
     """Get all batches/lots for a material, newest first."""
     find_material(material_id)
@@ -353,7 +367,7 @@ async def add_price_entry(
 async def list_price_history(
     material_id: int,
     supplier_id: Optional[int] = None,
-    user: Optional[User] = Depends(get_current_user_optional)
+    user: User = Depends(get_current_user)
 ):
     """List price history for a material, newest first."""
     find_material(material_id)
@@ -371,7 +385,7 @@ async def list_price_history(
 @router.get("/{material_id}/prices/summary")
 async def price_summary(
     material_id: int,
-    user: Optional[User] = Depends(get_current_user_optional)
+    user: User = Depends(get_current_user)
 ):
     """Per-supplier price stats: avg, min, max, last price, entry count."""
     find_material(material_id)

@@ -24,19 +24,103 @@ def set_data_stores(p, m, d, i):
 
 
 def find_product(product_id: int):
-    """Find product by ID."""
-    for product in products:
-        if product.id == product_id:
-            return product
-    raise HTTPException(status_code=404, detail=f"Product {product_id} không tồn tại")
+    """Find product by ID from Database."""
+    from sqlmodel import Session
+    from config.database import engine
+    from models.product import ProductTable, Product, MaterialUsage
+    import json
+
+    with Session(engine) as session:
+        row = session.get(ProductTable, product_id)
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Product {product_id} không tồn tại")
+            
+        mat_usages = []
+        if row.materials_json:
+            try:
+                mat_usages = [MaterialUsage(**m) for m in json.loads(row.materials_json)]
+            except Exception:
+                pass
+                
+        tags = []
+        if row.tags_json:
+            try:
+                tags = json.loads(row.tags_json)
+            except Exception:
+                pass
+        
+        cats = []
+        if row.categories_json:
+            try:
+                cats = json.loads(row.categories_json)
+            except Exception:
+                pass
+
+        seasons_list = []
+        if row.seasons_json:
+            try:
+                seasons_list = json.loads(row.seasons_json)
+            except Exception:
+                pass
+                
+        cost_breakdown = {}
+        if getattr(row, "cost_breakdown_json", None):
+            try:
+                cost_breakdown = json.loads(row.cost_breakdown_json)
+            except Exception:
+                pass
+
+        return Product(
+            id=row.id, name=row.name, base_price=row.base_price,
+            price=getattr(row, 'price', row.base_price) or row.base_price,
+            time_minutes=row.time_minutes or 0, difficulty=row.difficulty or 1,
+            wastage_percent=getattr(row, "wastage_percent", 0) or 0,
+            lifecycle_status=row.lifecycle_status or "idea",
+            role=row.role or "core",
+            notes=row.notes,
+            tags=tags, categories=cats, seasons=seasons_list,
+            packaging_cost=row.packaging_cost or 0,
+            marketing_cost=row.marketing_cost or 0,
+            platform_fee_percent=row.platform_fee_percent or 0,
+            cost_breakdown=cost_breakdown,
+            priority=row.priority or 1,
+            demand_score=row.demand_score or 0,
+            feasibility_score=row.feasibility_score or 0,
+            finished_qty=getattr(row, "finished_qty", 0) or 0,
+            created_by=row.created_by,
+            updated_by=row.updated_by,
+            materials=mat_usages, created_at=row.created_at, updated_at=row.updated_at,
+        )
 
 
 def find_material_internal(material_id: int):
-    """Find material by ID (internal use)."""
-    for material in materials:
-        if material.id == material_id:
-            return material
-    return None
+    """Find material by ID from Database (internal use)."""
+    from sqlmodel import Session
+    from config.database import engine
+    from models.material import MaterialTable, Material
+    with Session(engine) as session:
+        row = session.get(MaterialTable, material_id)
+        if not row:
+            return None
+        
+        stock_qty = row.stock_quantity or 0
+        reserved_qty = getattr(row, "reserved_qty", None) or 0
+        on_hand_qty = getattr(row, "on_hand_qty", None) or 0
+        if on_hand_qty == 0 and stock_qty > 0:
+            on_hand_qty = stock_qty
+        available_qty = max(0.0, on_hand_qty - reserved_qty)
+        
+        return Material(
+            id=row.id, code=row.code, name=row.name, type=row.type,
+            unit=row.unit, unit_type=getattr(row, "unit_type", None) or "continuous",
+            unit_price=row.unit_price, stock_quantity=row.stock_quantity,
+            base_unit=getattr(row, "base_unit", None),
+            on_hand_qty=on_hand_qty,
+            reserved_qty=reserved_qty,
+            available_qty=available_qty,
+            low_threshold=row.low_threshold, supplier_id=getattr(row, "supplier_id", None),
+            note=row.note, created_at=row.created_at,
+        )
 
 
 def compute_product_cost(product) -> Dict[str, float]:
@@ -69,15 +153,20 @@ def compute_product_cost(product) -> Dict[str, float]:
 
     # Trend score from demand signals
     trend_score = 50
-    product_signals = sorted([d for d in demand_signals if d.product_id == product.id], key=lambda x: x.week_of)
-    if len(product_signals) >= 2:
-        latest, prev = product_signals[-1], product_signals[-2]
-        delta = latest.views - prev.views
-        base = prev.views or 1
-        trend_score = max(0, min(100, 50 + (delta / base) * 50))
-
-    open_issues = [i for i in issues if i.product_id == product.id and i.status != "resolved"]
-    issue_health = max(0, 100 - len(open_issues) * 20)
+    from sqlmodel import Session, select
+    from config.database import engine
+    from models.content import DemandSignalTable
+    from models.issue import IssueTable
+    with Session(engine) as session:
+        product_signals = session.exec(select(DemandSignalTable).where(DemandSignalTable.product_id == product.id).order_by(DemandSignalTable.week_of)).all()
+        if len(product_signals) >= 2:
+            latest, prev = product_signals[-1], product_signals[-2]
+            delta = latest.views - prev.views
+            base = prev.views or 1
+            trend_score = max(0, min(100, 50 + (delta / base) * 50))
+    
+        open_issues = session.exec(select(IssueTable).where(IssueTable.product_id == product.id).where(IssueTable.status != "resolved")).all()
+        issue_health = max(0, 100 - len(open_issues) * 20)
 
     profit_per_hour = 0
     if product.time_minutes > 0:

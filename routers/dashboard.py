@@ -4,7 +4,7 @@ from datetime import date, timedelta
 from fastapi import APIRouter, Depends, Query
 
 from models.user import User
-from services.auth import get_current_user, get_current_user_optional
+from services.auth import get_current_user
 from services.order import compute_order_totals
 from services.material import get_low_stock_alerts
 
@@ -409,7 +409,7 @@ def _active_goals():
 async def get_dashboard(
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
-    user: Optional[User] = Depends(get_current_user_optional)
+    user: User = Depends(get_current_user)
 ):
     today = date.today()
     if not start_date:
@@ -509,7 +509,7 @@ async def get_dashboard(
 async def get_dashboard_summary(
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
-    user: Optional[User] = Depends(get_current_user_optional)
+    user: User = Depends(get_current_user)
 ):
     return await get_dashboard(start_date, end_date, user)
 

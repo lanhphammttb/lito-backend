@@ -33,11 +33,56 @@ def set_data_stores(o, r, p, s, m):
 
 
 def find_order(order_id: int):
-    """Find order by ID."""
-    for order in orders:
-        if order.id == order_id:
-            return order
-    raise HTTPException(status_code=404, detail=f"Order {order_id} không tồn tại")
+    """Find order by ID using Database."""
+    from sqlmodel import Session
+    from config.database import engine
+    from models.order import OrderTable, Order, OrderLine, ShippingUpdate
+    import json
+    
+    with Session(engine) as session:
+        row = session.get(OrderTable, order_id)
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Order {order_id} không tồn tại")
+            
+        lines = []
+        if getattr(row, "lines", None):
+            lines = [OrderLine(product_id=l.product_id, quantity=l.quantity, unit_price=l.unit_price, variant_id=l.variant_id) for l in row.lines]
+        elif row.order_lines_json:
+            try:
+                lines = [OrderLine(**l) for l in json.loads(row.order_lines_json)]
+            except Exception:
+                pass
+                
+        shipping_updates = []
+        if getattr(row, "shipping_updates_json", None):
+            try:
+                shipping_updates = [ShippingUpdate(**u) for u in json.loads(row.shipping_updates_json)]
+            except Exception:
+                pass
+                
+        return Order(
+            id=row.id,
+            date=row.order_date,
+            channel=row.channel,
+            customer_id=row.customer_id,
+            order_lines=lines,
+            shipping_fee=row.shipping_fee,
+            discount=row.discount,
+            promo_code=row.promo_code,
+            status=row.status,
+            payment_status=row.payment_status,
+            shipping_carrier=row.shipping_carrier,
+            tracking_number=row.tracking_number,
+            estimated_delivery_date=row.estimated_delivery_date,
+            note=row.note,
+            maker_user_id=row.maker_user_id,
+            source_content_id=row.source_content_id,
+            created_by=row.created_by,
+            updated_by=row.updated_by,
+            shipping_updates=shipping_updates,
+            created_at=row.created_at,
+            updated_at=row.updated_at
+        )
 
 
 def validate_order_payload(payload):

@@ -2,7 +2,8 @@
 from typing import Optional, List
 from datetime import datetime, date as date_type
 from pydantic import BaseModel, Field
-from sqlmodel import SQLModel, Field as SQLField
+from sqlmodel import SQLModel, Field as SQLField, Relationship
+from utils.datetime import utcnow
 
 
 class OrderLine(BaseModel):
@@ -21,7 +22,7 @@ class ShippingUpdate(BaseModel):
     shipping_carrier: Optional[str] = None
     tracking_number: Optional[str] = None
     estimated_delivery_date: Optional[date_type] = None
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=utcnow)
 
 
 class Order(BaseModel):
@@ -45,8 +46,22 @@ class Order(BaseModel):
     source_content_id: Optional[int] = None
     created_by: Optional[int] = None
     updated_by: Optional[int] = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utcnow)
     updated_at: Optional[datetime] = None
+
+
+class OrderLineTable(SQLModel, table=True):
+    """Order line database table."""
+    __tablename__ = "order_lines"
+
+    id: Optional[int] = SQLField(default=None, primary_key=True)
+    order_id: int = SQLField(foreign_key="orders.id", index=True)
+    product_id: int = SQLField(index=True)
+    variant_id: Optional[int] = None
+    quantity: int = 1
+    unit_price: float = 0
+
+    order: "OrderTable" = Relationship(back_populates="lines")
 
 
 class OrderTable(SQLModel, table=True):
@@ -58,6 +73,7 @@ class OrderTable(SQLModel, table=True):
     channel: Optional[str] = None
     customer_id: Optional[int] = SQLField(default=None, index=True)
     order_lines_json: str = "[]"
+    lines: List[OrderLineTable] = Relationship(back_populates="order")
     shipping_fee: float = 0
     discount: float = 0
     promo_code: Optional[str] = None
@@ -72,7 +88,7 @@ class OrderTable(SQLModel, table=True):
     source_content_id: Optional[int] = None
     created_by: Optional[int] = None
     updated_by: Optional[int] = None
-    created_at: datetime = SQLField(default_factory=datetime.utcnow)
+    created_at: datetime = SQLField(default_factory=utcnow)
     updated_at: Optional[datetime] = None
 
 
@@ -93,7 +109,7 @@ class OrderReturn(BaseModel):
     refund_amount: Optional[float] = None
     status: str = "pending"  # pending, approved, rejected, processed
     created_by: Optional[int] = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utcnow)
 
 
 class OrderReturnTable(SQLModel, table=True):
@@ -107,7 +123,7 @@ class OrderReturnTable(SQLModel, table=True):
     refund_amount: Optional[float] = None
     status: str = "pending"
     created_by: Optional[int] = None
-    created_at: datetime = SQLField(default_factory=datetime.utcnow)
+    created_at: datetime = SQLField(default_factory=utcnow)
 
 
 class Payment(BaseModel):
@@ -120,7 +136,7 @@ class Payment(BaseModel):
     transaction_id: Optional[str] = None
     paid_date: Optional[datetime] = None
     notes: Optional[str] = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utcnow)
 
 
 class PaymentTable(SQLModel, table=True):
@@ -135,4 +151,4 @@ class PaymentTable(SQLModel, table=True):
     transaction_id: Optional[str] = None
     paid_date: Optional[datetime] = None
     notes: Optional[str] = None
-    created_at: datetime = SQLField(default_factory=datetime.utcnow)
+    created_at: datetime = SQLField(default_factory=utcnow)

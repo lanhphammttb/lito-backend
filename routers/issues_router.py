@@ -97,85 +97,107 @@ async def list_issues(
     offset: int = 0,
     response: Response = None,
 ):
-    def with_counts(src):
-        for i in src:
-            i.comments_count = len([c for c in issue_comments if c.issue_id == i.id])
-        return src
-
-    filtered = issues[:]
-    if product_id:
-        filtered = [i for i in filtered if i.product_id == product_id]
-    if status:
-        filtered = [i for i in filtered if i.status == status]
-    if priority is not None:
-        filtered = [i for i in filtered if i.priority == priority]
-    if assignee_id is not None:
-        filtered = [i for i in filtered if i.assigned_to == assignee_id]
-    if q:
-        q_lower = q.lower()
-        filtered = [i for i in filtered if q_lower in (i.description or "").lower() or q_lower in (i.type or "").lower()]
-    total = len(filtered)
-    if response is not None:
-        response.headers["X-Total-Count"] = str(total)
-    result = with_counts(filtered)[offset: offset + limit]
-    return [i.model_dump() if hasattr(i, 'model_dump') else i for i in result]
+    from sqlmodel import select, or_, func
+    with Session(engine) as session:
+        statement = select(IssueTable)
+        if product_id:
+            statement = statement.where(IssueTable.product_id == product_id)
+        if status:
+            statement = statement.where(IssueTable.status == status)
+        if priority is not None:
+            statement = statement.where(IssueTable.priority == priority)
+        if assignee_id is not None:
+            statement = statement.where(IssueTable.assigned_to == assignee_id)
+        if q:
+            q_lower = f"%{q.lower()}%"
+            statement = statement.where(
+                or_(
+                    func.lower(IssueTable.description).like(q_lower),
+                    func.lower(IssueTable.type).like(q_lower)
+                )
+            )
+            
+        total = len(session.exec(statement).all())
+        if response is not None:
+            response.headers["X-Total-Count"] = str(total)
+            
+        results = session.exec(statement.offset(offset).limit(limit)).all()
+        return [r.model_dump() for r in results]
 
 
 @router.get("/issues/{issue_id}/comments")
 async def list_issue_comments(issue_id: int):
     find_issue(issue_id)
-    return [c for c in issue_comments if c.issue_id == issue_id]
+    from sqlmodel import select
+    from models.issue import IssueCommentTable
+    with Session(engine) as session:
+        return [r.model_dump() for r in session.exec(select(IssueCommentTable).where(IssueCommentTable.issue_id == issue_id)).all()]
 
 
 @router.post("/issues/{issue_id}/comments")
 async def create_issue_comment(issue_id: int, payload: IssueCommentCreate):
-    find_issue(issue_id)
-    new_comment = IssueComment(
-        id=next_id(issue_comments),
-        issue_id=issue_id,
-        user_id=current_user.id,
-        content=payload.content,
-        created_at=datetime.utcnow(),
-    )
-    issue_comments.append(new_comment)
-    for i in issues:
-        if i.id == issue_id:
-            i.comments_count = len([c for c in issue_comments if c.issue_id == issue_id])
-            save_issue_sql(i)
-            break
-    return new_comment
+    issue = find_issue(issue_id)
+    from models.issue import IssueCommentTable
+    
+    with Session(engine) as session:
+        new_comment = IssueCommentTable(
+            issue_id=issue_id,
+            user_id=current_user.id,
+            content=payload.content,
+            created_at=datetime.utcnow(),
+        )
+        session.add(new_comment)
+        session.commit()
+        session.refresh(new_comment)
+        
+        # update count
+        row = session.get(IssueTable, issue_id)
+        if row:
+            from sqlmodel import select, func
+            count = session.exec(select(func.count(IssueCommentTable.id)).where(IssueCommentTable.issue_id == issue_id)).one()
+            row.comments_count = count
+            session.add(row)
+            session.commit()
+            
+    return new_comment.model_dump()
 
 
 @router.post("/issues")
 async def create_issue(payload: IssueCreate):
-    new_issue = Issue(
-        **payload.model_dump(),
-        id=next_id(issues),
-        created_at=datetime.utcnow(),
-        created_by=current_user.id,
-    )
-    issues.append(new_issue)
-    save_issue_sql(new_issue)
-    return new_issue
+    with Session(engine) as session:
+        row = IssueTable(
+            **payload.model_dump(),
+            created_at=datetime.utcnow(),
+            created_by=current_user.id,
+        )
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+    return row.model_dump()
 
 
 @router.put("/issues/{issue_id}")
 async def update_issue(issue_id: int, payload: Issue):
-    for idx, issue in enumerate(issues):
-        if issue.id == issue_id:
-            payload.id = issue_id
-            payload.created_at = issue.created_at
-            payload.created_by = issue.created_by
-            if getattr(payload, 'status', None) == "resolved" and getattr(payload, 'resolved_at', None) is None:
-                payload.resolved_at = datetime.utcnow()
-                payload.resolution_hours = (
-                    (payload.resolved_at - payload.created_at).total_seconds() / 3600
-                    if payload.created_at else None
-                )
-            issues[idx] = payload
-            save_issue_sql(payload)
-            return payload
-    raise HTTPException(status_code=404, detail="Issue không tồn tại")
+    with Session(engine) as session:
+        row = session.get(IssueTable, issue_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Issue không tồn tại")
+            
+        update_data = payload.model_dump(exclude_unset=True)
+        for key, value in update_data.items():
+            setattr(row, key, value)
+            
+        if getattr(row, 'status', None) == "resolved" and getattr(row, 'resolved_at', None) is None:
+            row.resolved_at = datetime.utcnow()
+            row.resolution_hours = (
+                (row.resolved_at - row.created_at).total_seconds() / 3600
+                if row.created_at else None
+            )
+            
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        return row.model_dump()
 
 
 @router.post("/issues/from-template")
@@ -183,33 +205,34 @@ async def create_issue_from_template(payload: IssueFromTemplateRequest):
     template = find_issue(payload.template_id)
     if not template.is_template:
         raise HTTPException(status_code=400, detail="Issue này không phải template")
-    new_issue = Issue(
-        id=next_id(issues),
-        product_id=payload.product_id,
-        type=template.type,
-        description=payload.description or template.description,
-        evidence=template.evidence,
-        hypothesis=template.hypothesis,
-        next_action=template.next_action,
-        priority=payload.priority or template.priority,
-        status="open",
-        impact_revenue=template.impact_revenue,
-        is_template=False,
-        created_by=current_user.id,
-        created_at=datetime.utcnow(),
-    )
-    issues.append(new_issue)
-    save_issue_sql(new_issue)
-    return new_issue
+        
+    with Session(engine) as session:
+        row = IssueTable(
+            product_id=payload.product_id,
+            type=template.type,
+            description=payload.description or template.description,
+            evidence=template.evidence,
+            hypothesis=template.hypothesis,
+            next_action=template.next_action,
+            priority=payload.priority or template.priority,
+            status="open",
+            impact_revenue=template.impact_revenue,
+            is_template=False,
+            created_by=current_user.id,
+            created_at=datetime.utcnow(),
+        )
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+    return row.model_dump()
 
 
 @router.delete("/issues/{issue_id}")
 async def delete_issue(issue_id: int):
-    for issue in issues:
-        if issue.id == issue_id:
-            issues.remove(issue)
-            with Session(engine) as session:
-                session.exec(sql_delete(IssueTable).where(IssueTable.id == issue_id))
-                session.commit()
-            return {"ok": True}
-    raise HTTPException(status_code=404, detail="Issue không tồn tại")
+    with Session(engine) as session:
+        row = session.get(IssueTable, issue_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Issue không tồn tại")
+        session.delete(row)
+        session.commit()
+    return {"ok": True}

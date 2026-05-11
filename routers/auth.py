@@ -1,5 +1,4 @@
 """Authentication routes."""
-from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Body
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlmodel import Session, select
@@ -14,6 +13,7 @@ from services.auth import (
     find_user_by_email,
 )
 from models.user import User, UserTable
+from utils.datetime import utcnow
 
 router = APIRouter()
 
@@ -32,7 +32,7 @@ def _do_login(email: str, password: str) -> TokenResponse:
         stmt = select(UserTable).where(UserTable.id == user.id)
         row = session.exec(stmt).first()
         if row:
-            row.last_login_at = datetime.utcnow()
+            row.last_login_at = utcnow()
             session.add(row)
             session.commit()
     
@@ -65,7 +65,7 @@ async def register(payload: LoginRequest):
             password_hash=hash_password(payload.password),
             role="USER",
             is_owner=False,
-            created_at=datetime.utcnow(),
+            created_at=utcnow(),
         )
         session.add(new_user)
         session.commit()

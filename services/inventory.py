@@ -25,11 +25,45 @@ def set_data_stores(s, p, m, sm):
 
 
 def find_supplier(supplier_id: int):
-    """Find supplier by ID."""
-    for supplier in suppliers:
-        if supplier.id == supplier_id:
-            return supplier
-    raise HTTPException(status_code=404, detail=f"Supplier {supplier_id} không tồn tại")
+    """Find supplier by ID from Database."""
+    from sqlmodel import Session
+    from config.database import engine
+    from models.inventory import SupplierTable, Supplier
+    with Session(engine) as session:
+        row = session.get(SupplierTable, supplier_id)
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Supplier {supplier_id} không tồn tại")
+        return Supplier(
+            id=row.id, name=row.name, contact_name=row.contact_name,
+            phone=row.phone, email=row.email, address=row.address,
+            note=row.note, rating=row.rating,
+            lead_time_days=getattr(row, "lead_time_days", None),
+            created_at=row.created_at,
+        )
+
+def find_purchase_order(po_id: int):
+    """Find purchase order by ID from Database."""
+    from sqlmodel import Session
+    from config.database import engine
+    import json
+    from models.inventory import PurchaseOrderTable, PurchaseOrder, PurchaseOrderLine
+    with Session(engine) as session:
+        row = session.get(PurchaseOrderTable, po_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Purchase order không tồn tại")
+        lines = []
+        if row.lines_json:
+            try:
+                lines = [PurchaseOrderLine(**l) for l in json.loads(row.lines_json)]
+            except:
+                pass
+        return PurchaseOrder(
+            id=row.id, supplier_id=row.supplier_id, status=row.status,
+            expected_date=row.expected_date, note=row.note, lines=lines,
+            total_amount=row.total_amount, paid_amount=row.paid_amount,
+            payment_status=row.payment_status,
+            created_by=row.created_by, received_at=row.received_at, created_at=row.created_at,
+        )
 
 
 def compute_po_total(lines: List[PurchaseOrderLine]) -> float:

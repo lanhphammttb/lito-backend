@@ -8,7 +8,7 @@ from config.database import engine, upsert_mongo, delete_mongo
 from models.user import User
 from models.customer import Customer, CustomerTable
 from schemas.customer import CustomerCreate
-from services.auth import get_current_user, get_current_user_optional
+from services.auth import get_current_user
 from services.customer import find_customer, compute_customer_metrics
 from services.activity import log_activity, create_audit_log
 from services.order import compute_order_totals
@@ -31,42 +31,48 @@ async def list_customers(
     limit: int = 100,
     search: Optional[str] = None,
     segment: Optional[str] = None,
-    user: Optional[User] = Depends(get_current_user_optional)
+    user: User = Depends(get_current_user)
 ):
-    """List all customers."""
-    result = customers[:]
-    
-    if search:
-        search_lower = search.lower()
-        result = [c for c in result if 
-            search_lower in c.name.lower() or 
-            search_lower in (c.phone or "").lower() or
-            search_lower in (c.email or "").lower()
-        ]
-    if segment:
-        result = [c for c in result if c.segment == segment]
-    
-    return result[skip:skip + limit]
+    """List all customers from Database."""
+    from sqlmodel import select, or_
+    with Session(engine) as session:
+        statement = select(CustomerTable)
+        if segment:
+            statement = statement.where(CustomerTable.segment == segment)
+        if search:
+            search_pattern = f"%{search}%"
+            statement = statement.where(or_(
+                CustomerTable.name.like(search_pattern),
+                CustomerTable.phone.like(search_pattern),
+                CustomerTable.email.like(search_pattern)
+            ))
+            
+        results = session.exec(statement.offset(skip).limit(limit)).all()
+        return [find_customer(r.id) for r in results]
 
 
 @router.get("/segments")
 async def get_customer_segments(user: User = Depends(get_current_user)):
-    """Get customer segment summary."""
-    segments = {}
-    for c in customers:
-        seg = c.segment or "unknown"
-        if seg not in segments:
-            segments[seg] = {"count": 0, "total_spent": 0}
-        segments[seg]["count"] += 1
-        segments[seg]["total_spent"] += c.total_spent or 0
-    
-    return segments
+    """Get customer segment summary from Database."""
+    from sqlmodel import select
+    with Session(engine) as session:
+        all_customers = session.exec(select(CustomerTable)).all()
+        segments = {}
+        for c in all_customers:
+            seg = c.segment or "unknown"
+            if seg not in segments:
+                segments[seg] = {"count": 0, "total_spent": 0}
+            segments[seg]["count"] += 1
+            segments[seg]["total_spent"] += c.total_spent or 0
+        
+        return segments
 
 
 @router.get("/lifecycle")
 async def get_customer_lifecycle(user: User = Depends(get_current_user)):
-    """Get customer lifecycle stages."""
+    """Get customer lifecycle stages from Database."""
     from datetime import date, timedelta
+    from sqlmodel import select
     
     today = date.today()
     thirty_days_ago = today - timedelta(days=30)
@@ -79,57 +85,80 @@ async def get_customer_lifecycle(user: User = Depends(get_current_user)):
         "dormant": [],  # Last order > 90 days ago
     }
     
-    for c in customers:
-        if not c.first_order_date:
-            continue
+    with Session(engine) as session:
+        all_customers = session.exec(select(CustomerTable)).all()
         
-        if c.first_order_date >= thirty_days_ago:
-            lifecycle["new"].append(c)
-        elif c.last_order_date and c.last_order_date >= thirty_days_ago:
-            lifecycle["active"].append(c)
-        elif c.last_order_date and c.last_order_date >= ninety_days_ago:
-            lifecycle["at_risk"].append(c)
-        else:
-            lifecycle["dormant"].append(c)
-    
-    return {
-        stage: {"count": len(custs), "customers": [{"id": c.id, "name": c.name} for c in custs[:10]]}
-        for stage, custs in lifecycle.items()
-    }
+        for c in all_customers:
+            if not c.first_order_date:
+                continue
+            
+            if c.first_order_date >= thirty_days_ago:
+                lifecycle["new"].append(c)
+            elif c.last_order_date and c.last_order_date >= thirty_days_ago:
+                lifecycle["active"].append(c)
+            elif c.last_order_date and c.last_order_date >= ninety_days_ago:
+                lifecycle["at_risk"].append(c)
+            else:
+                lifecycle["dormant"].append(c)
+        
+        return {
+            stage: {"count": len(custs), "customers": [{"id": c.id, "name": c.name} for c in custs[:10]]}
+            for stage, custs in lifecycle.items()
+        }
 
 
 @router.api_route("/auto-tag", methods=["GET", "POST"])
 async def auto_tag_customers(user: User = Depends(get_current_user)):
-    """Auto-tag customers based on RFM analysis."""
+    """Auto-tag customers based on RFM analysis from Database."""
+    from sqlmodel import select
+    from models.order import OrderTable
+    import json
+    
     tagged = 0
-    for c in customers:
-        orders_for_customer = [o for o in orders if o.customer_id == c.id]
-        if not orders_for_customer:
-            continue
-        total_spent = sum(compute_order_totals(o).get("revenue", 0) for o in orders_for_customer)
-        if total_spent > 500000:
-            if not hasattr(c, 'tags') or c.tags is None:
-                c.tags = []
-            if 'VIP' not in c.tags:
-                c.tags.append('VIP')
-                tagged += 1
+    with Session(engine) as session:
+        all_customers = session.exec(select(CustomerTable)).all()
+        for c in all_customers:
+            orders_for_customer = session.exec(select(OrderTable).where(OrderTable.customer_id == c.id)).all()
+            if not orders_for_customer:
+                continue
+            total_spent = sum(getattr(o, "revenue", 0) or 0 for o in orders_for_customer)
+            if total_spent > 500000:
+                tags = []
+                if c.tags:
+                    try:
+                        tags = json.loads(c.tags) if c.tags.startswith('[') else [t.strip() for t in c.tags.split(',') if t.strip()]
+                    except:
+                        tags = []
+                if 'VIP' not in tags:
+                    tags.append('VIP')
+                    c.tags = json.dumps(tags)
+                    session.add(c)
+                    tagged += 1
+        session.commit()
     return {"tagged": tagged, "message": f"Đã gắn tag cho {tagged} khách hàng"}
 
 
 @router.get("/summary")
 async def get_customers_summary(user: User = Depends(get_current_user)):
-    """Get customer summary with full customer and order lists."""
+    """Get customer summary with full customer and order lists from DB."""
+    from sqlmodel import select
+    from models.order import OrderTable
+    
+    with Session(engine) as session:
+        all_customers = session.exec(select(CustomerTable)).all()
+        all_orders = session.exec(select(OrderTable)).all()
+
     now = datetime.utcnow()
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     new_this_month = sum(
-        1 for c in customers
+        1 for c in all_customers
         if c.created_at and c.created_at >= month_start
     )
 
     # Build per-customer order stats for RFM
     today = now.date()
     customer_orders: dict = {}
-    for o in orders:
+    for o in all_orders:
         cid = getattr(o, 'customer_id', None)
         if not cid:
             continue
@@ -156,7 +185,7 @@ async def get_customers_summary(user: User = Depends(get_current_user)):
         return r + f + m
 
     analytics = []
-    for c in customers:
+    for c in all_customers:
         stats = customer_orders.get(c.id, {})
         order_count = stats.get("order_count", 0)
         total_revenue = stats.get("total_revenue", 0.0)
@@ -175,11 +204,11 @@ async def get_customers_summary(user: User = Depends(get_current_user)):
     analytics.sort(key=lambda x: x["rfm_score"], reverse=True)
 
     return {
-        "total": len(customers),
+        "total": len(all_customers),
         "new_this_month": new_this_month,
-        "total_spent": sum(c.total_spent or 0 for c in customers),
-        "customers": [c.model_dump() for c in customers],
-        "orders": [o.model_dump() for o in orders],
+        "total_spent": sum(c.total_spent or 0 for c in all_customers),
+        "customers": [find_customer(c.id).model_dump() for c in all_customers],
+        "orders": [dict(o) for o in all_orders],  # Return bare DB objects to prevent dependency issues
         "analytics": analytics,
     }
 
@@ -187,7 +216,7 @@ async def get_customers_summary(user: User = Depends(get_current_user)):
 @router.get("/{customer_id}")
 async def get_customer(
     customer_id: int,
-    user: Optional[User] = Depends(get_current_user_optional)
+    user: User = Depends(get_current_user)
 ):
     """Get single customer."""
     return find_customer(customer_id)
@@ -200,11 +229,10 @@ async def create_customer(
     user: User = Depends(get_current_user)
 ):
     """Create new customer."""
-    new_id = max((c.id for c in customers), default=0) + 1
     now = datetime.utcnow()
     
     customer = Customer(
-        id=new_id,
+        id=0,
         name=payload.name,
         phone=payload.phone,
         email=payload.email,
@@ -215,11 +243,10 @@ async def create_customer(
         tags=payload.tags or [],
         created_at=now,
     )
-    customers.append(customer)
     
     # Save to SQL
     with Session(engine) as session:
-        session.add(CustomerTable(
+        row = CustomerTable(
             name=customer.name,
             phone=customer.phone,
             email=customer.email,
@@ -229,12 +256,16 @@ async def create_customer(
             source=customer.source,
             tags=str(customer.tags) if customer.tags else None,
             created_at=customer.created_at,
-        ))
+        )
+        session.add(row)
         session.commit()
+        session.refresh(row)
+
+    customer.id = row.id
     
     upsert_mongo("customers", customer.model_dump(mode="json") if hasattr(customer, "model_dump") else customer.__dict__)
-    log_activity(user.id, "customer", new_id, "create", {"name": customer.name})
-    await create_audit_log(user, "CREATE", "customers", new_id, None, customer.__dict__, request)
+    log_activity(user.id, "customer", customer.id, "create", {"name": customer.name})
+    await create_audit_log(user, "CREATE", "customers", customer.id, None, customer.__dict__, request)
     return customer
 
 
@@ -287,9 +318,7 @@ async def delete_customer(
 ):
     """Delete customer."""
     customer = find_customer(customer_id)
-    before_data = customer.__dict__.copy()
-    
-    customers.remove(customer)
+    before_data = customer.model_dump() if hasattr(customer, "model_dump") else customer.__dict__.copy()
     
     # Delete from SQL
     with Session(engine) as session:

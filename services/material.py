@@ -18,11 +18,33 @@ def set_data_stores(m):
 
 
 def find_material(material_id: int):
-    """Find material by ID."""
-    for material in materials:
-        if material.id == material_id:
-            return material
-    raise HTTPException(status_code=404, detail=f"Material {material_id} không tồn tại")
+    """Find material by ID from Database."""
+    from sqlmodel import Session
+    from config.database import engine
+    from models.material import MaterialTable, Material
+    with Session(engine) as session:
+        row = session.get(MaterialTable, material_id)
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Material {material_id} không tồn tại")
+        
+        stock_qty = row.stock_quantity or 0
+        reserved_qty = getattr(row, "reserved_qty", None) or 0
+        on_hand_qty = getattr(row, "on_hand_qty", None) or 0
+        if on_hand_qty == 0 and stock_qty > 0:
+            on_hand_qty = stock_qty
+        available_qty = max(0.0, on_hand_qty - reserved_qty)
+        
+        return Material(
+            id=row.id, code=row.code, name=row.name, type=row.type,
+            unit=row.unit, unit_type=getattr(row, "unit_type", None) or "continuous",
+            unit_price=row.unit_price, stock_quantity=row.stock_quantity,
+            base_unit=getattr(row, "base_unit", None),
+            on_hand_qty=on_hand_qty,
+            reserved_qty=reserved_qty,
+            available_qty=available_qty,
+            low_threshold=row.low_threshold, supplier_id=getattr(row, "supplier_id", None),
+            note=row.note, created_at=row.created_at,
+        )
 
 
 def get_reserved_quantity(material_id: int, reference_type=None, reference_id=None) -> float:
@@ -65,25 +87,36 @@ def get_available_quantity(material_id: int) -> float:
 
 
 def get_low_stock_alerts() -> List[dict]:
-    """Get materials with low stock."""
+    """Get materials with low stock from Database."""
+    from sqlmodel import Session, select
+    from config.database import engine
+    from models.material import MaterialTable
+    
     threshold = settings.low_stock_threshold
     alerts = []
-    for m in materials:
-        if m.stock_quantity <= (m.low_threshold or threshold):
-            alerts.append({
-                "material_id": m.id,
-                "code": m.code,
-                "name": m.name,
-                "stock_quantity": m.stock_quantity,
-                "on_hand_qty": getattr(m, "on_hand_qty", m.stock_quantity),
-                "reserved_quantity": get_reserved_quantity(m.id),
-                "available_quantity": get_available_quantity(m.id),
-                "unit": m.unit,
-                "base_unit": getattr(m, "base_unit", None),
-                "low_threshold": m.low_threshold,
-                "unit_price": m.unit_price or 0,
-                "supplier_id": getattr(m, "supplier_id", None),
-            })
+    with Session(engine) as session:
+        rows = session.exec(select(MaterialTable)).all()
+        for m in rows:
+            m_threshold = m.low_threshold if m.low_threshold is not None else threshold
+            if m.stock_quantity <= m_threshold:
+                on_hand = getattr(m, "on_hand_qty", m.stock_quantity)
+                if on_hand == 0 and m.stock_quantity > 0:
+                    on_hand = m.stock_quantity
+                
+                alerts.append({
+                    "material_id": m.id,
+                    "code": m.code,
+                    "name": m.name,
+                    "stock_quantity": m.stock_quantity,
+                    "on_hand_qty": on_hand,
+                    "reserved_quantity": get_reserved_quantity(m.id),
+                    "available_quantity": get_available_quantity(m.id),
+                    "unit": m.unit,
+                    "base_unit": getattr(m, "base_unit", None),
+                    "low_threshold": m.low_threshold,
+                    "unit_price": m.unit_price or 0,
+                    "supplier_id": getattr(m, "supplier_id", None),
+                })
     return alerts
 
 

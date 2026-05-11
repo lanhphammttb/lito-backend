@@ -17,12 +17,13 @@ class ExperimentUpdate(DummyModel): pass
 
 router = APIRouter()
 current_user = User(id=1, email="admin@hala.vn", role="admin", name="Admin", password_hash="dummy")
-experiments: List = []
-
+from datetime import datetime
+from sqlmodel import Session, select
+from config.database import engine
+from models.experiment import ExperimentTable
 
 def set_data_stores(ex):
-    global experiments
-    experiments = ex
+    pass
 
 
 def next_id(collection) -> int:
@@ -31,38 +32,47 @@ def next_id(collection) -> int:
 
 @router.get("/experiments")
 async def list_experiments():
-    return [i.model_dump() if hasattr(i, 'model_dump') else i for i in experiments]
+    with Session(engine) as session:
+        return [r.model_dump() for r in session.exec(select(ExperimentTable)).all()]
 
 
 @router.post("/experiments")
 async def create_experiment(payload: ExperimentCreate):
-    new_exp = Experiment(
-        id=next_id(experiments),
-        **payload.model_dump(),
-        created_by=current_user.id,
-        created_at=datetime.utcnow(),
-    )
-    experiments.append(new_exp)
-    return new_exp
+    with Session(engine) as session:
+        row = ExperimentTable(
+            **payload.model_dump(),
+            created_by=current_user.id,
+            created_at=datetime.utcnow(),
+        )
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+    return row.model_dump()
 
 
 @router.put("/experiments/{exp_id}")
 async def update_experiment(exp_id: int, payload: ExperimentUpdate):
-    for idx, exp in enumerate(experiments):
-        if exp.id == exp_id:
-            data = exp.model_dump()
-            for field, value in payload.model_dump(exclude_none=True).items():
-                data[field] = value
-            updated = Experiment(**data)
-            experiments[idx] = updated
-            return updated
-    raise HTTPException(status_code=404, detail="Experiment không tồn tại")
+    with Session(engine) as session:
+        row = session.get(ExperimentTable, exp_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Experiment không tồn tại")
+        
+        for field, value in payload.model_dump(exclude_none=True).items():
+            if field != "id" and field != "created_by" and field != "created_at":
+                setattr(row, field, value)
+                
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        return row.model_dump()
 
 
 @router.delete("/experiments/{exp_id}")
 async def delete_experiment(exp_id: int):
-    for exp in experiments:
-        if exp.id == exp_id:
-            experiments.remove(exp)
-            return {"ok": True}
-    raise HTTPException(status_code=404, detail="Experiment không tồn tại")
+    with Session(engine) as session:
+        row = session.get(ExperimentTable, exp_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Experiment không tồn tại")
+        session.delete(row)
+        session.commit()
+    return {"ok": True}

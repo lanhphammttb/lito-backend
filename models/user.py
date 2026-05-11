@@ -1,8 +1,9 @@
 """User models."""
 from typing import Optional
 from datetime import datetime
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, ConfigDict
 from sqlmodel import SQLModel, Field as SQLField
+from utils.datetime import utcnow
 
 
 class User(BaseModel):
@@ -13,7 +14,7 @@ class User(BaseModel):
     password_hash: str
     role: str = "ADMIN"
     is_owner: bool = False
-    created_at: datetime = datetime.utcnow()
+    created_at: datetime = utcnow()
     last_login_at: Optional[datetime] = None
 
 
@@ -27,12 +28,14 @@ class UserTable(SQLModel, table=True):
     password_hash: str
     role: str = "ADMIN"
     is_owner: bool = False
-    created_at: datetime = SQLField(default_factory=datetime.utcnow)
+    created_at: datetime = SQLField(default_factory=utcnow)
     last_login_at: Optional[datetime] = None
 
 
 class UserPublic(BaseModel):
     """Public user response (without password)."""
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     name: str
     email: str
@@ -41,5 +44,3 @@ class UserPublic(BaseModel):
     created_at: datetime
     last_login_at: Optional[datetime]
 
-    class Config:
-        from_attributes = True

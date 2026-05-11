@@ -14,9 +14,11 @@ router = APIRouter()
 
 
 @router.get("")
-async def get_settings():
+async def get_settings(user: User = Depends(get_current_user)):
     """Get application settings."""
-    return app_settings.model_dump()
+    if user.role == "ADMIN":
+        return app_settings.admin_dump()
+    return app_settings.public_dump()
 
 
 @router.put("")
@@ -59,7 +61,7 @@ async def update_settings(
     if "hourly_rate" in payload:
         clear_product_cost_cache()
 
-    return app_settings.model_dump()
+    return app_settings.admin_dump() if user.role == "ADMIN" else app_settings.public_dump()
 
 
 @router.patch("")
@@ -74,9 +76,13 @@ async def patch_settings(
 @router.get("/{key}")
 async def get_setting(key: str, user: User = Depends(get_current_user)):
     """Get specific setting value."""
+    if user.role != "ADMIN" and key not in app_settings.public_dump():
+        raise HTTPException(status_code=403, detail=f"Setting {key} requires admin access")
     with Session(engine) as session:
         row = session.exec(select(SettingsTable).where(SettingsTable.id == 1)).first()
         if row and hasattr(row, key):
+            if user.role != "ADMIN" and key not in app_settings.public_dump():
+                raise HTTPException(status_code=403, detail=f"Setting {key} requires admin access")
             return {"key": key, "value": getattr(row, key)}
     
     # Check in-memory settings

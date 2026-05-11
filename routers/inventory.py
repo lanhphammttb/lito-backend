@@ -109,11 +109,17 @@ async def inventory_summary(user: User = Depends(get_current_user)):
         product_dict["max_units_from_stock"] = max_units
         enhanced_products.append(product_dict)
 
+    with Session(engine) as session:
+        all_suppliers = session.exec(select(SupplierTable)).all()
+        all_pos = session.exec(select(PurchaseOrderTable)).all()
+
+    from services.inventory import find_supplier, find_purchase_order
+
     return {
-        "materials": _materials,
+        "materials": [dict(m) for m in _materials],
         "products": enhanced_products,
-        "suppliers": suppliers,
-        "purchase_orders": purchase_orders,
+        "suppliers": [find_supplier(s.id).model_dump() for s in all_suppliers],
+        "purchase_orders": [find_purchase_order(p.id).model_dump() for p in all_pos],
         "statistics": {
             "total_materials": len(_materials),
             "low_stock_count": low_stock_count,
@@ -130,14 +136,16 @@ async def list_suppliers(
     search: Optional[str] = None,
     user: User = Depends(get_current_user)
 ):
-    """List all suppliers."""
-    result = suppliers[:]
-    
-    if search:
-        search_lower = search.lower()
-        result = [s for s in result if search_lower in s.name.lower()]
-    
-    return result[skip:skip + limit]
+    """List all suppliers from Database."""
+    from services.inventory import find_supplier
+    with Session(engine) as session:
+        statement = select(SupplierTable)
+        if search:
+            search_pattern = f"%{search}%"
+            statement = statement.where(SupplierTable.name.like(search_pattern))
+            
+        results = session.exec(statement.offset(skip).limit(limit)).all()
+        return [find_supplier(r.id) for r in results]
 
 
 @router.get("/suppliers/{supplier_id}")
@@ -183,7 +191,6 @@ async def create_supplier(
         lead_time_days=getattr(supplier_row, "lead_time_days", None),
         created_at=supplier_row.created_at,
     )
-    suppliers.append(supplier)
 
     log_activity(user.id, "supplier", supplier.id, "create", {"name": supplier.name})
     return supplier
@@ -234,7 +241,6 @@ async def delete_supplier(
     """Delete supplier."""
     require_admin(user)
     supplier = find_supplier(supplier_id)
-    suppliers.remove(supplier)
 
     with Session(engine) as session:
         row = session.get(SupplierTable, supplier_id)
@@ -371,7 +377,6 @@ async def auto_create_purchase_orders(
             created_by=po_row.created_by,
             created_at=po_row.created_at,
         )
-        purchase_orders.append(po)
         created.append(po_row.id)
 
     log_activity(user.id, "purchase_order", None, "auto_create", {"count": len(created)})
@@ -386,36 +391,35 @@ async def list_purchase_orders(
     supplier_id: Optional[int] = None,
     user: User = Depends(get_current_user)
 ):
-    """List purchase orders."""
-    result = purchase_orders[:]
-    
-    if status:
-        result = [po for po in result if po.status == status]
-    if supplier_id:
-        result = [po for po in result if po.supplier_id == supplier_id]
-    
-    result.sort(key=lambda x: x.created_at, reverse=True)
-    
-    # Add computed total
-    output = []
-    for po in result[skip:skip + limit]:
-        output.append({
-            **po.__dict__,
-            "computed_total": compute_po_total(po.lines),
-        })
-    
-    return output
+    """List purchase orders from DB."""
+    from services.inventory import find_purchase_order
+    with Session(engine) as session:
+        statement = select(PurchaseOrderTable)
+        if status:
+            statement = statement.where(PurchaseOrderTable.status == status)
+        if supplier_id:
+            statement = statement.where(PurchaseOrderTable.supplier_id == supplier_id)
+            
+        statement = statement.order_by(PurchaseOrderTable.created_at.desc()).offset(skip).limit(limit)
+        results = session.exec(statement).all()
+        
+        output = []
+        for row in results:
+            po = find_purchase_order(row.id)
+            output.append({
+                **po.model_dump(),
+                "computed_total": compute_po_total(po.lines),
+            })
+        return output
 
 
 @router.get("/purchase-orders/{po_id}")
 async def get_purchase_order(po_id: int, user: User = Depends(get_current_user)):
     """Get single purchase order."""
-    po = next((p for p in purchase_orders if p.id == po_id), None)
-    if not po:
-        raise HTTPException(status_code=404, detail="Purchase order không tồn tại")
-    
+    from services.inventory import find_purchase_order
+    po = find_purchase_order(po_id)
     return {
-        **po.__dict__,
+        **po.model_dump(),
         "computed_total": compute_po_total(po.lines),
     }
 
@@ -469,7 +473,6 @@ async def create_purchase_order(
         created_by=po_row.created_by,
         created_at=po_row.created_at,
     )
-    purchase_orders.append(po)
 
     log_activity(user.id, "purchase_order", po.id, "create", {"supplier_id": po.supplier_id})
     return {**po.__dict__, "computed_total": compute_po_total(po.lines)}
@@ -482,9 +485,8 @@ async def update_po_status(
     user: User = Depends(get_current_user)
 ):
     """Update purchase order status."""
-    po = next((p for p in purchase_orders if p.id == po_id), None)
-    if not po:
-        raise HTTPException(status_code=404, detail="Purchase order không tồn tại")
+    from services.inventory import find_purchase_order
+    po = find_purchase_order(po_id)
 
     new_status = payload.get("status")
     if new_status not in PURCHASE_ORDER_STATUS_ALLOWED:
@@ -520,9 +522,8 @@ async def record_po_payment(
     payload: { amount: float, method: str, note: str? }
     Cumulates paid_amount; sets payment_status = partial | paid automatically.
     """
-    po = next((p for p in purchase_orders if p.id == po_id), None)
-    if not po:
-        raise HTTPException(status_code=404, detail="Purchase order không tồn tại")
+    from services.inventory import find_purchase_order
+    po = find_purchase_order(po_id)
 
     amount = float(payload.get("amount", 0))
     if amount <= 0:
@@ -566,14 +567,11 @@ async def delete_purchase_order(
     user: User = Depends(get_current_user)
 ):
     """Delete purchase order."""
-    po = next((p for p in purchase_orders if p.id == po_id), None)
-    if not po:
-        raise HTTPException(status_code=404, detail="Purchase order không tồn tại")
+    from services.inventory import find_purchase_order
+    po = find_purchase_order(po_id)
 
     if po.status == "received":
         raise HTTPException(status_code=400, detail="Không thể xóa PO đã nhận hàng")
-
-    purchase_orders.remove(po)
 
     with Session(engine) as session:
         row = session.get(PurchaseOrderTable, po_id)

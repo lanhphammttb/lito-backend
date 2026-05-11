@@ -2,20 +2,42 @@
 import os
 from dotenv import load_dotenv
 from typing import List, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 # Load environment variables from .env file
 import os; load_dotenv(os.path.join(os.path.dirname(__file__), '../.env'))
 
 # Environment variables
-JWT_SECRET = os.getenv("JWT_SECRET", "your-secret-key-change-in-production")
+JWT_SECRET = os.getenv("JWT_SECRET")
 JWT_ALGO = "HS256"
 USE_MONGO = os.getenv("USE_MONGO", "false").lower() == "true"
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./hala.db")
+CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv(
+        "CORS_ORIGINS",
+        "http://localhost:5173,http://localhost:3000,http://127.0.0.1:5173,http://127.0.0.1:3000",
+    ).split(",")
+    if origin.strip()
+]
+
+_INVALID_JWT_SECRETS = {
+    "",
+    "changeme",
+    "devsecret",
+    "your-secret-key-change-in-production",
+}
+
+if not JWT_SECRET or JWT_SECRET.strip() in _INVALID_JWT_SECRETS:
+    raise RuntimeError(
+        "JWT_SECRET must be set to a non-placeholder value in backend/.env or environment."
+    )
 
 
 class Settings(BaseModel):
     """Business settings model."""
+    model_config = ConfigDict(extra="ignore")
+
     hourly_rate: float = 50000
     default_profit_margin: float = 0.5
     low_stock_threshold: float = 1.0
@@ -47,9 +69,24 @@ class Settings(BaseModel):
     lazada_app_secret: Optional[str] = None
     lazada_access_token: Optional[str] = None
 
+    def public_dump(self) -> dict:
+        """Return a settings payload that is safe to expose to authenticated clients."""
+        return self.model_dump(exclude=_SECRET_FIELDS)
+
+    def admin_dump(self) -> dict:
+        """Return the full settings payload for admin users."""
+        return self.model_dump()
+
 
 # Global settings instance
 settings = Settings()
+
+_SECRET_FIELDS = {
+    "smtp_password",
+    "shopee_partner_key",
+    "lazada_app_secret",
+    "lazada_access_token",
+}
 
 
 # Constants

@@ -3,6 +3,7 @@ from typing import Optional, Dict, Any
 from datetime import datetime
 from pydantic import BaseModel, Field
 from sqlmodel import SQLModel, Field as SQLField
+from utils.datetime import utcnow
 
 
 class ActivityLog(BaseModel):
@@ -13,7 +14,7 @@ class ActivityLog(BaseModel):
     entity_id: Optional[int] = None
     action: str
     changes: Optional[Dict[str, Any]] = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utcnow)
 
 
 class ActivityLogTable(SQLModel, table=True):
@@ -26,7 +27,7 @@ class ActivityLogTable(SQLModel, table=True):
     entity_id: Optional[int] = None
     action: str
     changes: Optional[str] = None  # JSON string
-    created_at: datetime = SQLField(default_factory=datetime.utcnow)
+    created_at: datetime = SQLField(default_factory=utcnow)
 
 
 class AuditLogTable(SQLModel, table=True):
@@ -43,4 +44,4 @@ class AuditLogTable(SQLModel, table=True):
     after_data: Optional[str] = None  # JSON string
     ip_address: Optional[str] = None
     user_agent: Optional[str] = None
-    timestamp: datetime = SQLField(default_factory=datetime.utcnow)
+    timestamp: datetime = SQLField(default_factory=utcnow)

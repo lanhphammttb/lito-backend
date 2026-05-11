@@ -28,7 +28,9 @@ from services.material import find_material
 from services.notification import ws_manager
 from routers.products import save_product_sql
 
+from sqlmodel import select
 router = APIRouter()
+
 production_jobs: List[ProductionJob] = []
 
 
@@ -92,13 +94,25 @@ async def list_production_jobs(
     order_id: Optional[int] = None,
     user: User = Depends(get_current_user),
 ):
-    result = production_jobs[:]
-    if status:
-        result = [job for job in result if job.status == status]
-    if order_id:
-        result = [job for job in result if job.order_id == order_id]
-    result.sort(key=lambda job: job.created_at, reverse=True)
-    return result
+    with Session(engine) as session:
+        statement = select(ProductionJobTable)
+        if status:
+            statement = statement.where(ProductionJobTable.status == status)
+        if order_id:
+            statement = statement.where(ProductionJobTable.order_id == order_id)
+            
+        statement = statement.order_by(ProductionJobTable.created_at.desc())
+        results = session.exec(statement).all()
+        
+        output = []
+        for r in results:
+            d = r.model_dump()
+            try:
+                d['materials'] = json.loads(d.get('materials_json', '[]') or '[]')
+            except:
+                d['materials'] = []
+            output.append(d)
+        return output
 
 
 @router.post("")
@@ -126,7 +140,9 @@ async def create_production_job(
             )
 
     requirements = calculate_product_material_requirements(product, payload.quantity)
-    new_id = max((j.id for j in production_jobs), default=0) + 1
+    with Session(engine) as session:
+        new_id = session.exec(select(ProductionJobTable.id).order_by(ProductionJobTable.id.desc())).first() or 0
+        new_id += 1
 
     job = ProductionJob(
         id=new_id,
@@ -147,7 +163,6 @@ async def create_production_job(
         created_at=datetime.utcnow(),
         updated_at=datetime.utcnow(),
     )
-    production_jobs.append(job)
     save_production_job_sql(job)
     return job
 
@@ -164,9 +179,17 @@ async def update_production_job_status(
     cancelled trước in_progress → release reserve.
     cancelled sau in_progress → 409, phải xử lý thủ công.
     """
-    job = next((j for j in production_jobs if j.id == job_id), None)
-    if not job:
-        raise HTTPException(status_code=404, detail="Production job không tồn tại")
+    with Session(engine) as session:
+        row = session.get(ProductionJobTable, job_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Production job không tồn tại")
+        
+        job = ProductionJob(**row.model_dump())
+        try:
+            materials_dicts = json.loads(row.materials_json or '[]')
+            job.materials = [ProductionMaterial(**m) for m in materials_dicts]
+        except:
+            job.materials = []
 
     old_status = job.status
     new_status = payload.status

@@ -14,7 +14,7 @@ from models.order import (
     ShippingUpdate
 )
 from schemas.order import OrderCreate, OrderReturnCreate, PaymentCreate, ShippingUpdatePayload
-from services.auth import get_current_user, get_current_user_optional, require_admin
+from services.auth import get_current_user, require_admin
 from services.order import (
     compute_order_totals, validate_order_payload, apply_promo,
     reserve_stock_for_order, restock_for_order, find_order
@@ -23,6 +23,9 @@ from services.activity import log_activity, create_audit_log
 from services.notification import notify_new_order, notify_order_status_change
 from services.product import find_product
 from routers.products import save_product_sql
+from utils.datetime import utcnow
+from sqlmodel import select
+from models.order import OrderLineTable
 
 
 def save_order_sql(order):
@@ -92,8 +95,97 @@ def save_order_sql(order):
                 created_at=order.created_at,
                 updated_at=getattr(order, "updated_at", None),
             )
+            session.add(row)
+        
+        # Handle relational OrderLineTable
+        existing_lines = session.exec(select(OrderLineTable).where(OrderLineTable.order_id == order.id)).all()
+        for line in existing_lines:
+            session.delete(line)
+        
+        for l in order.order_lines:
+            new_line = OrderLineTable(
+                order_id=order.id,
+                product_id=l.product_id,
+                quantity=l.quantity,
+                unit_price=l.unit_price,
+                variant_id=l.variant_id
+            )
+            session.add(new_line)
+
+        session.commit()
+
+
+def save_return_sql(return_obj: OrderReturn) -> OrderReturn:
+    """Persist an order return and return the normalized model."""
+    with Session(engine) as session:
+        row = session.get(OrderReturnTable, return_obj.id) if getattr(return_obj, "id", None) else None
+        if row:
+            row.order_id = return_obj.order_id
+            row.reason = return_obj.reason
+            row.amount = return_obj.amount
+            row.refund_amount = return_obj.refund_amount
+            row.status = return_obj.status
+            row.created_by = return_obj.created_by
+        else:
+            row = OrderReturnTable(
+                order_id=return_obj.order_id,
+                reason=return_obj.reason,
+                amount=return_obj.amount,
+                refund_amount=return_obj.refund_amount,
+                status=return_obj.status,
+                created_by=return_obj.created_by,
+            )
         session.add(row)
         session.commit()
+        session.refresh(row)
+        return OrderReturn(
+            id=row.id,
+            order_id=row.order_id,
+            reason=row.reason,
+            amount=row.amount,
+            refund_amount=row.refund_amount,
+            status=row.status,
+            created_by=row.created_by,
+            created_at=row.created_at,
+        )
+
+
+def save_payment_sql(payment: Payment) -> Payment:
+    """Persist a payment and return the normalized model."""
+    with Session(engine) as session:
+        row = session.get(PaymentTable, payment.id) if getattr(payment, "id", None) else None
+        if row:
+            row.order_id = payment.order_id
+            row.amount = payment.amount
+            row.method = payment.method
+            row.status = payment.status
+            row.transaction_id = payment.transaction_id
+            row.paid_date = payment.paid_date
+            row.notes = payment.notes
+        else:
+            row = PaymentTable(
+                order_id=payment.order_id,
+                amount=payment.amount,
+                method=payment.method,
+                status=payment.status,
+                transaction_id=payment.transaction_id,
+                paid_date=payment.paid_date,
+                notes=payment.notes,
+            )
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        return Payment(
+            id=row.id,
+            order_id=row.order_id,
+            amount=row.amount,
+            method=row.method,
+            status=row.status,
+            transaction_id=row.transaction_id,
+            paid_date=row.paid_date,
+            notes=row.notes,
+            created_at=row.created_at,
+        )
 
 router = APIRouter()
 RESERVE_STATUSES = {"confirmed", "producing"}
@@ -166,33 +258,68 @@ async def list_orders(
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
     search: Optional[str] = None,
-    user: Optional[User] = Depends(get_current_user_optional)
+    user: User = Depends(get_current_user)
 ):
-    """List all orders."""
-    result = orders[:]
+    """List all orders directly from Database using SQLModel."""
+    with Session(engine) as session:
+        statement = select(OrderTable)
 
-    if status:
-        result = [o for o in result if o.status == status]
-    if customer_id:
-        result = [o for o in result if o.customer_id == customer_id]
-    if start_date:
-        result = [o for o in result if o.date >= start_date]
-    if end_date:
-        result = [o for o in result if o.date <= end_date]
-    if search:
-        search_lower = search.lower()
-        result = [o for o in result if search_lower in str(o.id) or search_lower in (o.note or "").lower()]
+        if status:
+            statement = statement.where(OrderTable.status == status)
+        if customer_id:
+            statement = statement.where(OrderTable.customer_id == customer_id)
+        if start_date:
+            statement = statement.where(OrderTable.order_date >= start_date)
+        if end_date:
+            statement = statement.where(OrderTable.order_date <= end_date)
 
-    # Sort by date descending
-    result.sort(key=lambda x: x.date, reverse=True)
+        # Handle Search (Simple ILIKE alternative for notes)
+        if search:
+            search_pattern = f"%{search}%"
+            statement = statement.where(OrderTable.note.like(search_pattern))
 
-    # Add computed totals
-    output = []
-    for o in result[skip:skip + limit]:
-        totals = compute_order_totals(o)
-        output.append({**o.model_dump(), "computed": totals})
+        statement = statement.order_by(OrderTable.order_date.desc()).offset(skip).limit(limit)
+        results = session.exec(statement).all()
 
-    return output
+        output = []
+        for row in results:
+            # Build relational lines if available, fallback to JSON
+            lines = []
+            if row.lines:
+                lines = [OrderLine(product_id=l.product_id, quantity=l.quantity, unit_price=l.unit_price, variant_id=l.variant_id) for l in row.lines]
+            elif row.order_lines_json:
+                try:
+                    lines = [OrderLine(**l) for l in json.loads(row.order_lines_json)]
+                except Exception:
+                    pass
+            
+            order_obj = Order(
+                id=row.id,
+                date=row.order_date,
+                channel=row.channel,
+                customer_id=row.customer_id,
+                order_lines=lines,
+                shipping_fee=row.shipping_fee,
+                discount=row.discount,
+                promo_code=row.promo_code,
+                status=row.status,
+                payment_status=row.payment_status,
+                shipping_carrier=row.shipping_carrier,
+                tracking_number=row.tracking_number,
+                estimated_delivery_date=row.estimated_delivery_date,
+                note=row.note,
+                maker_user_id=row.maker_user_id,
+                source_content_id=row.source_content_id,
+                created_by=row.created_by,
+                updated_by=row.updated_by,
+                created_at=row.created_at,
+                updated_at=row.updated_at
+            )
+            
+            totals = compute_order_totals(order_obj)
+            output.append({**order_obj.model_dump(), "computed": totals})
+
+        return output
 
 
 _products = []
@@ -211,25 +338,77 @@ def set_related_stores(p, c, u, cp=None):
 
 
 @router.get("/summary")
-async def get_orders_summary(user: Optional[User] = Depends(get_current_user_optional)):
+async def get_orders_summary(user: User = Depends(get_current_user)):
     """Get order summary stats for orders page."""
     orders_out = []
     user_revenue: dict = {}
     user_profit: dict = {}
     user_count: dict = {}
 
-    for o in sorted(orders, key=lambda x: x.date, reverse=True):
-        totals = compute_order_totals(o)
-        # Merge computed revenue/profit into dict so frontend can use o.revenue directly
-        orders_out.append({**o.model_dump(), **totals, "computed": totals})
-        # Accumulate per-maker stats
-        uid = getattr(o, 'assigned_to', None) or getattr(o, 'creator_id', None)
-        if uid:
-            user_revenue[uid] = user_revenue.get(uid, 0) + totals["revenue"]
-            user_profit[uid] = user_profit.get(uid, 0) + totals["profit"]
-            user_count[uid] = user_count.get(uid, 0) + 1
+    with Session(engine) as session:
+        statement = select(OrderTable).order_by(OrderTable.order_date.desc())
+        results = session.exec(statement).all()
+        
+        pending_count = 0
+        completed_count = 0
 
-    total_revenue = sum(r["revenue"] for r in (o["computed"] for o in orders_out))
+        for row in results:
+            if row.status == "pending":
+                pending_count += 1
+            elif row.status in ("done", "delivered", "completed"):
+                completed_count += 1
+
+            lines = []
+            if getattr(row, "lines", None):
+                lines = [OrderLine(product_id=l.product_id, quantity=l.quantity, unit_price=l.unit_price, variant_id=l.variant_id) for l in row.lines]
+            elif row.order_lines_json:
+                try:
+                    lines = [OrderLine(**l) for l in json.loads(row.order_lines_json)]
+                except Exception:
+                    pass
+                    
+            from models.order import ShippingUpdate
+            shipping_updates = []
+            if getattr(row, "shipping_updates_json", None):
+                try:
+                    shipping_updates = [ShippingUpdate(**u) for u in json.loads(row.shipping_updates_json)]
+                except Exception:
+                    pass
+
+            order_obj = Order(
+                id=row.id,
+                date=row.order_date,
+                channel=row.channel,
+                customer_id=row.customer_id,
+                order_lines=lines,
+                shipping_fee=row.shipping_fee,
+                discount=row.discount,
+                promo_code=row.promo_code,
+                status=row.status,
+                payment_status=row.payment_status,
+                shipping_carrier=row.shipping_carrier,
+                tracking_number=row.tracking_number,
+                estimated_delivery_date=row.estimated_delivery_date,
+                note=row.note,
+                maker_user_id=row.maker_user_id,
+                source_content_id=row.source_content_id,
+                created_by=row.created_by,
+                updated_by=row.updated_by,
+                shipping_updates=shipping_updates,
+                created_at=row.created_at,
+                updated_at=row.updated_at
+            )
+
+            totals = compute_order_totals(order_obj)
+            orders_out.append({**order_obj.model_dump(), **totals, "computed": totals})
+            
+            uid = getattr(order_obj, 'assigned_to', None) or getattr(order_obj, 'created_by', None)
+            if uid:
+                user_revenue[uid] = user_revenue.get(uid, 0) + totals["revenue"]
+                user_profit[uid] = user_profit.get(uid, 0) + totals["profit"]
+                user_count[uid] = user_count.get(uid, 0) + 1
+
+    total_revenue = sum(o["computed"]["revenue"] for o in orders_out)
 
     products_out = [p.model_dump() if hasattr(p, 'model_dump') else dict(p) for p in _products]
     customers_out = [c.model_dump() if hasattr(c, 'model_dump') else dict(c) for c in _customers]
@@ -247,10 +426,10 @@ async def get_orders_summary(user: Optional[User] = Depends(get_current_user_opt
     ]
 
     return {
-        "total_orders": len(orders),
+        "total_orders": len(orders_out),
         "total_revenue": total_revenue,
-        "pending": len([o for o in orders if o.status == "pending"]),
-        "completed": len([o for o in orders if o.status in ("done", "delivered", "completed")]),
+        "pending": pending_count,
+        "completed": completed_count,
         "orders": orders_out,
         "products": products_out,
         "customers": customers_out,
@@ -263,19 +442,23 @@ async def get_orders_summary(user: Optional[User] = Depends(get_current_user_opt
 @router.get("/{order_id}")
 async def get_order(
     order_id: int,
-    user: Optional[User] = Depends(get_current_user_optional)
+    user: User = Depends(get_current_user)
 ):
-    """Get single order with details."""
+    """Get single order with details directly from Database."""
     order = find_order(order_id)
     totals = compute_order_totals(order)
 
-    return {
-        **order.model_dump(),
-        "computed": totals,
-        "returns": [r for r in order_returns if r.order_id == order_id],
-        "payments": [p for p in payments if p.order_id == order_id],
-        "shipping_updates": [s for s in shipping_updates if s.order_id == order_id],
-    }
+    with Session(engine) as session:
+        returns_db = session.exec(select(OrderReturnTable).where(OrderReturnTable.order_id == order_id)).all()
+        payments_db = session.exec(select(PaymentTable).where(PaymentTable.order_id == order_id)).all()
+        
+        return {
+            **order.model_dump(),
+            "computed": totals,
+            "returns": [r.model_dump() for r in returns_db],
+            "payments": [p.model_dump() for p in payments_db],
+            "shipping_updates": [s.model_dump() for s in order.shipping_updates],
+        }
 
 
 @router.post("")
@@ -289,7 +472,7 @@ async def create_order(
     apply_promo(payload)
 
     new_id = max((o.id for o in orders), default=0) + 1
-    now = datetime.utcnow()
+    now = utcnow()
 
     order = Order(
         id=new_id,
@@ -315,8 +498,6 @@ async def create_order(
             variant_id=line_data.variant_id,
         )
         order.order_lines.append(line)
-
-    orders.append(order)
 
     if order.status in RESERVE_STATUSES:
         reserve_stock_for_order(order, user)
@@ -416,7 +597,7 @@ async def update_order(
                 "order_lines": order.order_lines,
             })())
 
-    order.updated_at = datetime.utcnow()
+    order.updated_at = utcnow()
 
     _apply_stock_transition(old_status, order.status, order, user)
 
@@ -483,7 +664,7 @@ async def update_order_status(
     before_data = order.__dict__.copy()
 
     order.status = new_status
-    order.updated_at = datetime.utcnow()
+    order.updated_at = utcnow()
 
     _apply_stock_transition(old_status, new_status, order, user)
 
@@ -509,8 +690,6 @@ async def delete_order(
     if order.status in RESERVE_STATUSES:
         restock_for_order(order, user)
 
-    orders.remove(order)
-
     with Session(engine) as session:
         row = session.get(OrderTable, order_id)
         if row:
@@ -532,22 +711,22 @@ async def create_return(
     """Create order return."""
     find_order(order_id)
 
-    new_id = max((r.id for r in order_returns), default=0) + 1
-
     return_obj = OrderReturn(
-        id=new_id,
+        id=0,
         order_id=order_id,
         reason=payload.reason,
         amount=payload.amount,
         refund_amount=payload.refund_amount,
         status="pending",
-        created_at=datetime.utcnow(),
+        created_by=user.id,
+        created_at=utcnow(),
     )
-    order_returns.append(return_obj)
+    persisted_return = save_return_sql(return_obj)
+    order_returns.append(persisted_return)
 
-    log_activity(user.id, "order_return", new_id, "create", {"order_id": order_id})
+    log_activity(user.id, "order_return", persisted_return.id, "create", {"order_id": order_id})
 
-    return return_obj
+    return persisted_return
 
 
 @router.post("/{order_id}/payments")
@@ -560,22 +739,23 @@ async def create_payment(
     """Add payment to order."""
     find_order(order_id)
 
-    new_id = max((p.id for p in payments), default=0) + 1
-
     payment = Payment(
-        id=new_id,
+        id=0,
         order_id=order_id,
         amount=payload.amount,
         method=payload.method,
+        status=payload.status,
         transaction_id=payload.transaction_id,
+        paid_date=utcnow() if payload.status == "paid" else None,
         notes=payload.notes,
-        created_at=datetime.utcnow(),
+        created_at=utcnow(),
     )
-    payments.append(payment)
+    persisted_payment = save_payment_sql(payment)
+    payments.append(persisted_payment)
 
-    log_activity(user.id, "payment", new_id, "create", {"order_id": order_id, "amount": payload.amount})
+    log_activity(user.id, "payment", persisted_payment.id, "create", {"order_id": order_id, "amount": payload.amount})
 
-    return payment
+    return persisted_payment
 
 
 @router.post("/{order_id}/shipping")
@@ -594,7 +774,7 @@ async def add_shipping_update(
         shipping_carrier=payload.shipping_carrier,
         tracking_number=payload.tracking_number,
         estimated_delivery_date=payload.estimated_delivery_date,
-        timestamp=datetime.utcnow(),
+        timestamp=utcnow(),
     )
     shipping_updates.append(update)
 

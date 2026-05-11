@@ -11,7 +11,8 @@ from services.auth import get_current_user, require_admin
 
 router = APIRouter()
 
-# In-memory data store
+from models.activity import ActivityLogTable
+
 activity_logs: List[ActivityLog] = []
 
 
@@ -24,17 +25,29 @@ async def list_activity(
     action: Optional[str] = None,
     user: User = Depends(get_current_user)
 ):
-    """List activity logs."""
-    result = activity_logs[:]
-    
-    if entity_type:
-        result = [a for a in result if a.entity_type == entity_type]
-    if user_id:
-        result = [a for a in result if a.user_id == user_id]
-    if action:
-        result = [a for a in result if a.action == action]
-    
-    return result[skip:skip + limit]
+    """List activity logs from DB."""
+    import json
+    with Session(engine) as session:
+        statement = select(ActivityLogTable)
+        if entity_type:
+            statement = statement.where(ActivityLogTable.entity_type == entity_type)
+        if user_id:
+            statement = statement.where(ActivityLogTable.user_id == user_id)
+        if action:
+            statement = statement.where(ActivityLogTable.action == action)
+            
+        statement = statement.order_by(ActivityLogTable.created_at.desc()).offset(skip).limit(limit)
+        results = session.exec(statement).all()
+        
+        output = []
+        for r in results:
+            d = r.model_dump()
+            try:
+                d['changes'] = json.loads(d['changes']) if d['changes'] else None
+            except:
+                pass
+            output.append(d)
+        return output
 
 
 @router.get("/audit")
@@ -92,31 +105,34 @@ async def activity_summary(
     days: int = 7,
     user: User = Depends(get_current_user)
 ):
-    """Get activity summary."""
+    """Get activity summary from DB."""
     from datetime import datetime, timedelta
     
     cutoff = datetime.utcnow() - timedelta(days=days)
-    recent = [a for a in activity_logs if a.created_at >= cutoff]
     
-    # Group by entity type
-    by_entity = {}
-    for a in recent:
-        entity = a.entity_type
-        if entity not in by_entity:
-            by_entity[entity] = {"create": 0, "update": 0, "delete": 0, "other": 0}
-        action_group = a.action if a.action in ("create", "update", "delete") else "other"
-        by_entity[entity][action_group] += 1
-    
-    # Group by day
-    by_day = {}
-    for a in recent:
-        day = a.created_at.date().isoformat()
-        if day not in by_day:
-            by_day[day] = 0
-        by_day[day] += 1
-    
-    return {
-        "total": len(recent),
-        "by_entity_type": by_entity,
-        "by_day": by_day,
-    }
+    with Session(engine) as session:
+        statement = select(ActivityLogTable).where(ActivityLogTable.created_at >= cutoff)
+        recent = session.exec(statement).all()
+        
+        # Group by entity type
+        by_entity = {}
+        for a in recent:
+            entity = a.entity_type
+            if entity not in by_entity:
+                by_entity[entity] = {"create": 0, "update": 0, "delete": 0, "other": 0}
+            action_group = a.action if a.action in ("create", "update", "delete") else "other"
+            by_entity[entity][action_group] += 1
+        
+        # Group by day
+        by_day = {}
+        for a in recent:
+            day = a.created_at.date().isoformat()
+            if day not in by_day:
+                by_day[day] = 0
+            by_day[day] += 1
+        
+        return {
+            "total": len(recent),
+            "by_entity_type": by_entity,
+            "by_day": by_day,
+        }

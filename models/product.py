@@ -4,6 +4,7 @@ from datetime import datetime
 from pydantic import BaseModel, Field
 from sqlmodel import SQLModel, Field as SQLField
 import json
+from utils.datetime import utcnow
 
 
 class MaterialUsage(BaseModel):
@@ -40,7 +41,7 @@ class Product(BaseModel):
     finished_qty: int = 0
     created_by: Optional[int] = None
     updated_by: Optional[int] = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utcnow)
     updated_at: Optional[datetime] = None
 
 
@@ -71,7 +72,7 @@ class ProductTable(SQLModel, table=True):
     finished_qty: int = 0
     created_by: Optional[int] = None
     updated_by: Optional[int] = None
-    created_at: datetime = SQLField(default_factory=datetime.utcnow)
+    created_at: datetime = SQLField(default_factory=utcnow)
     updated_at: Optional[datetime] = None
 
 
@@ -96,7 +97,7 @@ class ProductVariant(BaseModel):
     price_modifier: float = 0
     stock_quantity: int = 0
     is_active: bool = True
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utcnow)
 
 
 class ProductVariantTable(SQLModel, table=True):
@@ -110,7 +111,7 @@ class ProductVariantTable(SQLModel, table=True):
     price_modifier: float = 0
     stock_quantity: int = 0
     is_active: bool = True
-    created_at: datetime = SQLField(default_factory=datetime.utcnow)
+    created_at: datetime = SQLField(default_factory=utcnow)
 
 
 class ProductBundle(BaseModel):
@@ -120,7 +121,7 @@ class ProductBundle(BaseModel):
     child_product_id: int
     quantity: int = 1
     discount_percent: float = 0
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utcnow)
 
 
 class ProductBundleTable(SQLModel, table=True):
@@ -132,7 +133,7 @@ class ProductBundleTable(SQLModel, table=True):
     child_product_id: int
     quantity: int = 1
     discount_percent: float = 0
-    created_at: datetime = SQLField(default_factory=datetime.utcnow)
+    created_at: datetime = SQLField(default_factory=utcnow)
 
 
 class ProductImage(BaseModel):
@@ -144,7 +145,7 @@ class ProductImage(BaseModel):
     display_order: int = 0
     is_primary: bool = False
     is_public: bool = True
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utcnow)
 
 
 class ProductImageTable(SQLModel, table=True):
@@ -158,7 +159,7 @@ class ProductImageTable(SQLModel, table=True):
     display_order: int = 0
     is_primary: bool = False
     is_public: bool = True
-    created_at: datetime = SQLField(default_factory=datetime.utcnow)
+    created_at: datetime = SQLField(default_factory=utcnow)
 
 
 class ProductReview(BaseModel):
@@ -171,7 +172,7 @@ class ProductReview(BaseModel):
     content: Optional[str] = None
     has_image: bool = False
     images: List[str] = []
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=utcnow)
 
 
 class ProductReviewTable(SQLModel, table=True):
@@ -186,7 +187,7 @@ class ProductReviewTable(SQLModel, table=True):
     content: Optional[str] = None
     has_image: bool = False
     images_json: str = "[]"
-    created_at: datetime = SQLField(default_factory=datetime.utcnow)
+    created_at: datetime = SQLField(default_factory=utcnow)
 
 
 class PriceChange(BaseModel):
@@ -196,7 +197,7 @@ class PriceChange(BaseModel):
     old_price: float
     new_price: float
     changed_by: Optional[int] = None
-    changed_at: datetime = Field(default_factory=datetime.utcnow)
+    changed_at: datetime = Field(default_factory=utcnow)
 
 
 class PriceChangeTable(SQLModel, table=True):
@@ -208,7 +209,7 @@ class PriceChangeTable(SQLModel, table=True):
     old_price: float
     new_price: float
     changed_by: Optional[int] = None
-    changed_at: datetime = SQLField(default_factory=datetime.utcnow)
+    changed_at: datetime = SQLField(default_factory=utcnow)
 
 
 class LifecycleEvent(BaseModel):
@@ -218,7 +219,7 @@ class LifecycleEvent(BaseModel):
     status: str
     note: Optional[str] = None
     changed_by: Optional[int] = None
-    changed_at: datetime = Field(default_factory=datetime.utcnow)
+    changed_at: datetime = Field(default_factory=utcnow)
 
 
 class LifecycleEventTable(SQLModel, table=True):
@@ -230,4 +231,4 @@ class LifecycleEventTable(SQLModel, table=True):
     status: str
     note: Optional[str] = None
     changed_by: Optional[int] = None
-    changed_at: datetime = SQLField(default_factory=datetime.utcnow)
+    changed_at: datetime = SQLField(default_factory=utcnow)

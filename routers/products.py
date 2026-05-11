@@ -16,12 +16,13 @@ from schemas.product import (
     ProductCreate, ProductVariantCreate, ProductBundleCreate,
     ProductImageCreate, ProductReviewCreate
 )
-from services.auth import get_current_user, get_current_user_optional, require_admin
+from services.auth import get_current_user, require_admin
 from services.product import (
     compute_product_cost, get_product_cost_cached, clear_product_cost_cache,
     find_product
 )
 from services.activity import log_activity, create_audit_log
+from utils.datetime import utcnow
 import json
 
 
@@ -78,6 +79,143 @@ def save_product_sql(product):
         session.add(row)
         session.commit()
 
+
+def save_variant_sql(variant: ProductVariant) -> ProductVariant:
+    """Persist a product variant and return the normalized model."""
+    with Session(engine) as session:
+        row = session.get(ProductVariantTable, variant.id) if getattr(variant, "id", None) else None
+        if row:
+            row.product_id = variant.product_id
+            row.name = variant.name
+            row.sku = variant.sku
+            row.price_modifier = variant.price_modifier
+            row.stock_quantity = variant.stock_quantity
+            row.is_active = variant.is_active
+        else:
+            row = ProductVariantTable(
+                product_id=variant.product_id,
+                name=variant.name,
+                sku=variant.sku,
+                price_modifier=variant.price_modifier,
+                stock_quantity=variant.stock_quantity,
+                is_active=variant.is_active,
+            )
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        return ProductVariant(
+            id=row.id,
+            product_id=row.product_id,
+            name=row.name,
+            sku=row.sku,
+            price_modifier=row.price_modifier,
+            stock_quantity=row.stock_quantity,
+            is_active=row.is_active,
+            created_at=row.created_at,
+        )
+
+
+def save_image_sql(image: ProductImage) -> ProductImage:
+    """Persist a product image and return the normalized model."""
+    with Session(engine) as session:
+        row = session.get(ProductImageTable, image.id) if getattr(image, "id", None) else None
+        if row:
+            row.product_id = image.product_id
+            row.url = image.url
+            row.type = image.type
+            row.display_order = image.display_order
+            row.is_primary = image.is_primary
+            row.is_public = image.is_public
+        else:
+            row = ProductImageTable(
+                product_id=image.product_id,
+                url=image.url,
+                type=image.type,
+                display_order=image.display_order,
+                is_primary=image.is_primary,
+                is_public=image.is_public,
+            )
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        return ProductImage(
+            id=row.id,
+            product_id=row.product_id,
+            url=row.url,
+            type=row.type,
+            display_order=row.display_order,
+            is_primary=row.is_primary,
+            is_public=row.is_public,
+            created_at=row.created_at,
+        )
+
+
+def save_review_sql(review: ProductReview) -> ProductReview:
+    """Persist a product review and return the normalized model."""
+    with Session(engine) as session:
+        row = session.get(ProductReviewTable, review.id) if getattr(review, "id", None) else None
+        if row:
+            row.product_id = review.product_id
+            row.customer_id = review.customer_id
+            row.customer_name = review.customer_name
+            row.rating = review.rating
+            row.content = review.content
+            row.has_image = review.has_image
+            row.images_json = json.dumps(review.images or [])
+        else:
+            row = ProductReviewTable(
+                product_id=review.product_id,
+                customer_id=review.customer_id,
+                customer_name=review.customer_name,
+                rating=review.rating,
+                content=review.content,
+                has_image=review.has_image,
+                images_json=json.dumps(review.images or []),
+            )
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        return ProductReview(
+            id=row.id,
+            product_id=row.product_id,
+            customer_id=row.customer_id,
+            customer_name=row.customer_name,
+            rating=row.rating,
+            content=row.content,
+            has_image=row.has_image,
+            images=json.loads(row.images_json) if row.images_json else [],
+            created_at=row.created_at,
+        )
+
+
+def save_bundle_sql(bundle: ProductBundle) -> ProductBundle:
+    """Persist a product bundle and return the normalized model."""
+    with Session(engine) as session:
+        row = session.get(ProductBundleTable, bundle.id) if getattr(bundle, "id", None) else None
+        if row:
+            row.parent_product_id = bundle.parent_product_id
+            row.child_product_id = bundle.child_product_id
+            row.quantity = bundle.quantity
+            row.discount_percent = bundle.discount_percent
+        else:
+            row = ProductBundleTable(
+                parent_product_id=bundle.parent_product_id,
+                child_product_id=bundle.child_product_id,
+                quantity=bundle.quantity,
+                discount_percent=bundle.discount_percent,
+            )
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        return ProductBundle(
+            id=row.id,
+            parent_product_id=row.parent_product_id,
+            child_product_id=row.child_product_id,
+            quantity=row.quantity,
+            discount_percent=row.discount_percent,
+            created_at=row.created_at,
+        )
+
 router = APIRouter()
 public_router = APIRouter()
 
@@ -99,14 +237,14 @@ def _tone_from_tags(tags: Optional[List[str]]) -> str:
 
 
 def _public_images_for_product(product_id: int) -> List[ProductImage]:
-    return sorted(
-        [
-            img
-            for img in product_images
-            if img.product_id == product_id and getattr(img, "is_public", True)
-        ],
-        key=lambda img: (not getattr(img, "is_primary", False), getattr(img, "display_order", 0)),
-    )
+    from sqlmodel import select
+    with Session(engine) as session:
+        images = session.exec(
+            select(ProductImageTable)
+            .where(ProductImageTable.product_id == product_id)
+            .where(ProductImageTable.is_public == True)
+        ).all()
+        return sorted(images, key=lambda img: (not getattr(img, "is_primary", False), getattr(img, "display_order", 0)))
 
 
 def _fallback_image(product_id: int) -> str:
@@ -123,41 +261,57 @@ async def list_products(
     category_id: Optional[int] = None,
     status: Optional[str] = None,
     search: Optional[str] = None,
-    user: Optional[User] = Depends(get_current_user_optional)
+    user: User = Depends(get_current_user)
 ):
-    """List all products with filtering."""
-    result = products[:]
+    """List all products with filtering from Database."""
+    from sqlmodel import select
+    with Session(engine) as session:
+        statement = select(ProductTable)
+        if status:
+            statement = statement.where(ProductTable.lifecycle_status == status)
+        if search:
+            search_pattern = f"%{search}%"
+            statement = statement.where(ProductTable.name.like(search_pattern))
+            
+        # Retrieve slightly more than limit if we need to filter by JSON categories
+        statement = statement.offset(skip).limit(limit * 2 if category_id else limit)
+        results = session.exec(statement).all()
 
-    if category_id:
-        result = [p for p in result if category_id in (p.categories or [])]
-    if status:
-        result = [p for p in result if p.lifecycle_status == status]
-    if search:
-        search_lower = search.lower()
-        result = [p for p in result if search_lower in p.name.lower() or search_lower in (p.notes or "").lower()]
+        output = []
+        for row in results:
+            if len(output) >= limit:
+                break
+                
+            p = find_product(row.id)
+            
+            if category_id and category_id not in p.categories:
+                continue
+                
+            cost_data = get_product_cost_cached(p)
+            images = session.exec(select(ProductImageTable).where(ProductImageTable.product_id == p.id)).all()
+            variants = session.exec(select(ProductVariantTable).where(ProductVariantTable.product_id == p.id)).all()
+            
+            output.append({
+                **p.model_dump(),
+                "computed": cost_data,
+                "images": [img.model_dump() for img in images],
+                "variants": [v.model_dump() for v in variants],
+            })
 
-    # Add computed cost for each product
-    output = []
-    for p in result[skip:skip + limit]:
-        cost_data = get_product_cost_cached(p)
-        output.append({
-            **p.__dict__,
-            "computed": cost_data,
-            "images": [img for img in product_images if img.product_id == p.id],
-            "variants": [v for v in product_variants if v.product_id == p.id],
-        })
-
-    return output
+        return output
 
 
 @router.get("/summary")
-async def get_products_summary(user: Optional[User] = Depends(get_current_user_optional)):
+async def get_products_summary(user: User = Depends(get_current_user)):
     """Get product summary stats for dashboard widgets."""
-    return {
-        "total": len(products),
-        "active": len([p for p in products if p.lifecycle_status in {"prototype", "experiment", "live"}]),
-        "out_of_stock": 0,
-    }
+    from sqlmodel import select
+    with Session(engine) as session:
+        all_products = session.exec(select(ProductTable)).all()
+        return {
+            "total": len(all_products),
+            "active": sum(1 for p in all_products if p.lifecycle_status in {"prototype", "experiment", "live"}),
+            "out_of_stock": 0,
+        }
 
 
 @public_router.get("/public/products")
@@ -165,30 +319,35 @@ async def public_list_products(
     category_id: Optional[int] = None,
     search: Optional[str] = None,
 ):
-    """Public endpoint for landing page product listing."""
-    filtered = [p for p in products if p.lifecycle_status == "live"]
+    """Public endpoint for landing page product listing directly from DB."""
+    from sqlmodel import select
+    with Session(engine) as session:
+        statement = select(ProductTable).where(ProductTable.lifecycle_status == "live")
+        if search:
+            search_pattern = f"%{search}%"
+            statement = statement.where(ProductTable.name.like(search_pattern))
+            
+        results = session.exec(statement).all()
+        
+        filtered = []
+        for row in results:
+            p = find_product(row.id)
+            if category_id and category_id not in p.categories:
+                continue
+            filtered.append(p)
 
-    if search:
-        search_lower = search.lower()
-        filtered = [
-            p for p in filtered
-            if search_lower in p.name.lower() or search_lower in (p.notes or "").lower()
-        ]
-    if category_id:
-        filtered = [p for p in filtered if category_id in (p.categories or [])]
-
-    items = []
-    for product in filtered:
-        images = _public_images_for_product(product.id)
-        primary = next((img for img in images if getattr(img, "is_primary", False)), images[0] if images else None)
-        items.append({
-            "id": product.id,
-            "name": product.name,
-            "base_price": product.base_price,
-            "tags": product.tags or [],
-            "image": primary.url if primary else _fallback_image(product.id),
-            "tone": _tone_from_tags(product.tags),
-        })
+        items = []
+        for product in filtered:
+            images = _public_images_for_product(product.id)
+            primary = next((img for img in images if getattr(img, "is_primary", False)), images[0] if images else None)
+            items.append({
+                "id": product.id,
+                "name": product.name,
+                "base_price": product.base_price,
+                "tags": product.tags or [],
+                "image": primary.url if primary else _fallback_image(product.id),
+                "tone": _tone_from_tags(product.tags),
+            })
 
     return {
         "items": items,
@@ -199,12 +358,12 @@ async def public_list_products(
 
 @public_router.get("/public/products/{product_id}")
 async def public_get_product(product_id: int):
-    """Public endpoint for landing page product detail."""
-    product = next(
-        (p for p in products if p.id == product_id and p.lifecycle_status == "live"),
-        None,
-    )
-    if not product:
+    """Public endpoint for landing page product detail from DB."""
+    try:
+        product = find_product(product_id)
+        if product.lifecycle_status != "live":
+            raise HTTPException(status_code=404, detail="Sản phẩm không khả dụng")
+    except HTTPException:
         raise HTTPException(status_code=404, detail="Sản phẩm không khả dụng")
 
     images = _public_images_for_product(product.id)
@@ -226,20 +385,27 @@ async def public_get_product(product_id: int):
 @router.get("/{product_id}")
 async def get_product(
     product_id: int,
-    user: Optional[User] = Depends(get_current_user_optional)
+    user: User = Depends(get_current_user)
 ):
-    """Get single product with full details."""
+    """Get single product with full details from DB."""
     product = find_product(product_id)
     cost_data = compute_product_cost(product)
+    
+    from sqlmodel import select
+    with Session(engine) as session:
+        images = session.exec(select(ProductImageTable).where(ProductImageTable.product_id == product_id)).all()
+        variants = session.exec(select(ProductVariantTable).where(ProductVariantTable.product_id == product_id)).all()
+        bundles = session.exec(select(ProductBundleTable).where(ProductBundleTable.parent_product_id == product_id)).all()
+        reviews = session.exec(select(ProductReviewTable).where(ProductReviewTable.product_id == product_id)).all()
 
-    return {
-        **product.__dict__,
-        "computed": cost_data,
-        "images": [img for img in product_images if img.product_id == product_id],
-        "variants": [v for v in product_variants if v.product_id == product_id],
-        "bundles": [b for b in product_bundles if b.bundle_product_id == product_id],
-        "reviews": [r for r in product_reviews if r.product_id == product_id],
-    }
+        return {
+            **product.model_dump(),
+            "computed": cost_data,
+            "images": [img.model_dump() for img in images],
+            "variants": [v.model_dump() for v in variants],
+            "bundles": [b.model_dump() for b in bundles],
+            "reviews": [r.model_dump() for r in reviews],
+        }
 
 
 @router.post("")
@@ -250,8 +416,13 @@ async def create_product(
 ):
     """Create new product."""
     require_admin(user)
-    new_id = max((p.id for p in products), default=0) + 1
-    now = datetime.utcnow()
+    
+    from sqlmodel import Session, select
+    with Session(engine) as session:
+        max_id_val = session.exec(select(ProductTable.id).order_by(ProductTable.id.desc())).first()
+        new_id = (max_id_val or 0) + 1
+
+    now = utcnow()
 
     product = Product(
         id=new_id,
@@ -288,7 +459,6 @@ async def create_product(
             )
             product.materials.append(usage)
 
-    products.append(product)
     clear_product_cost_cache(new_id)
 
     save_product_sql(product)
@@ -327,7 +497,7 @@ async def update_product(
     product.marketing_cost = payload.marketing_cost or 0
     product.platform_fee_percent = payload.platform_fee_percent or 0
     product.cost_breakdown = payload.cost_breakdown
-    product.updated_at = datetime.utcnow()
+    product.updated_at = utcnow()
 
     # Update materials
     if payload.materials is not None:
@@ -359,9 +529,8 @@ async def delete_product(
     """Delete product."""
     require_admin(user)
     product = find_product(product_id)
-    before_data = product.__dict__.copy()
+    before_data = product.model_dump() if hasattr(product, "model_dump") else product.__dict__.copy()
 
-    products.remove(product)
     clear_product_cost_cache(product_id)
 
     with Session(engine) as session:
@@ -384,9 +553,8 @@ async def add_variant(
     """Add product variant."""
     find_product(product_id)
 
-    new_id = max((v.id for v in product_variants), default=0) + 1
     variant = ProductVariant(
-        id=new_id,
+        id=0,
         product_id=product_id,
         name=payload.name,
         sku=payload.sku,
@@ -394,9 +562,9 @@ async def add_variant(
         stock_quantity=payload.stock_quantity or 0,
         is_active=payload.is_active,
     )
-    product_variants.append(variant)
+    persisted_variant = save_variant_sql(variant)
 
-    return variant
+    return persisted_variant
 
 
 @router.post("/{product_id}/images")
@@ -408,18 +576,17 @@ async def add_image(
     """Add product image."""
     find_product(product_id)
 
-    new_id = max((img.id for img in product_images), default=0) + 1
     image = ProductImage(
-        id=new_id,
+        id=0,
         product_id=product_id,
         url=payload.url,
         type=payload.type,
         is_primary=payload.is_primary or False,
         display_order=payload.display_order or 0,
     )
-    product_images.append(image)
+    persisted_image = save_image_sql(image)
 
-    return image
+    return persisted_image
 
 
 @router.post("/{product_id}/reviews")
@@ -431,9 +598,8 @@ async def add_review(
     """Add product review."""
     find_product(product_id)
 
-    new_id = max((r.id for r in product_reviews), default=0) + 1
     review = ProductReview(
-        id=new_id,
+        id=0,
         product_id=product_id,
         customer_id=payload.customer_id,
         customer_name=payload.customer_name,
@@ -441,17 +607,17 @@ async def add_review(
         content=payload.content,
         has_image=payload.has_image,
         images=payload.images,
-        created_at=datetime.utcnow(),
+        created_at=utcnow(),
     )
-    product_reviews.append(review)
+    persisted_review = save_review_sql(review)
 
-    return review
+    return persisted_review
 
 
 @router.get("/{product_id}/cost")
 async def get_product_cost(
     product_id: int,
-    user: Optional[User] = Depends(get_current_user_optional)
+    user: User = Depends(get_current_user)
 ):
     """Get detailed cost breakdown for product."""
     product = find_product(product_id)
@@ -471,7 +637,7 @@ async def adjust_finished_qty(
         raise HTTPException(status_code=400, detail="Số lượng thay đổi không được bằng 0")
     product.finished_qty = max(0, getattr(product, "finished_qty", 0) + delta)
     from datetime import datetime
-    product.updated_at = datetime.utcnow()
+    product.updated_at = utcnow()
     save_product_sql(product)
     log_activity(user.id, "product", product_id, "adjust_finished", {
         "change": delta,
