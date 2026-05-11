@@ -25,7 +25,19 @@ __pycache__/
 
 # Backup files
 main_old.py
+old_main.py
+_restored_main.py
 *.bak
+
+# Firebase service account (contains private key)
+firebase-adminsdk.json
+*-adminsdk-*.json
+
+# Misc scripts
+check_mongo.py
+sync_mongo_to_sql.py
+test_fcm.py
+log.txt
 
 # Logs
 *.log
