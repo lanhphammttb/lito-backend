@@ -1,0 +1,27 @@
+name: Deploy backend to AWS Singapore
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Executing remote ssh commands using password
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          port: 22
+          script: |
+            cd /home/ubuntu/lito-backend
+            git pull origin main
+            source /home/ubuntu/lito-backend/.venv/bin/activate
+            pip install -r requirements.txt
+            pm2 restart all
