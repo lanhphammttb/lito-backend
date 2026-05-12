@@ -891,13 +891,6 @@ app.include_router(ai_router, prefix="/ai", tags=["AI"])
 
 # ===================== Root Level API Endpoints =====================
 
-@app.get("/sentry-debug")
-async def trigger_error():
-    """Test endpoint to trigger an error and send to Sentry"""
-    division_by_zero = 1 / 0
-    return {"status": "ok"}
-
-
 @app.get("/me")
 async def get_me(user: User = Depends(get_current_user)):
     """Get current user info."""
