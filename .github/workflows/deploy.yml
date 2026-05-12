@@ -1,4 +1,4 @@
-name: Deploy backend to AWS Singapore
+name: Deploy backend to AWS Singapore (Docker)
 
 on:
   push:
@@ -12,7 +12,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      - name: Executing remote ssh commands using password
+      - name: Executing remote ssh commands using SSH Key
         uses: appleboy/ssh-action@master
         with:
           host: ${{ secrets.HOST }}
@@ -21,7 +21,19 @@ jobs:
           port: 22
           script: |
             cd /home/ubuntu/lito-backend
+
+            # 1. Dọn dẹp các file rác/untracked để tránh lỗi "overwritten by merge"
+            git clean -fd
+            git checkout .
+
+            # 2. Cập nhật code mới nhất từ GitHub
             git pull origin main
-            source /home/ubuntu/lito-backend/.venv/bin/activate
-            pip install -r requirements.txt
-            pm2 restart all
+
+            # 3. Build lại Docker image (LITO sẽ dùng bản Python 3.11 trong Dockerfile)
+            docker build -t lito-backend .
+
+            # 4. Thay thế Container cũ bằng Container mới
+            # Dừng và xóa container cũ nếu đang chạy, sau đó chạy bản mới nhất
+            docker stop lito-container || true
+            docker rm lito-container || true
+            docker run -d --name lito-container -p 8000:8000 lito-backend
