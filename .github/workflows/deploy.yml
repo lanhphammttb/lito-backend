@@ -20,20 +20,24 @@ jobs:
           key: ${{ secrets.SSH_KEY }}
           port: 22
           script: |
-            cd /home/ubuntu/lito-backend
+                      cd /home/ubuntu/lito-backend
+                      git clean -fd
+                      git checkout .
+                      git pull origin main
 
-            # 1. Dọn dẹp các file rác/untracked để tránh lỗi "overwritten by merge"
-            git clean -fd
-            git checkout .
+                      # 1. Build lại image mới
+                      docker build -t lito-backend .
 
-            # 2. Cập nhật code mới nhất từ GitHub
-            git pull origin main
+                      # 2. Dọn dẹp container cũ nếu có
+                      docker stop lito-container || true
+                      docker rm lito-container || true
 
-            # 3. Build lại Docker image (LITO sẽ dùng bản Python 3.11 trong Dockerfile)
-            docker build -t lito-backend .
+                      # 3. CỰC KỲ QUAN TRỌNG: Đảm bảo cổng 8000 hoàn toàn trống
+                      # Lệnh này sẽ tìm và "tiêu diệt" bất kỳ tiến trình nào đang chiếm cổng 8000
+                      sudo fuser -k 8000/tcp || true
 
-            # 4. Thay thế Container cũ bằng Container mới
-            # Dừng và xóa container cũ nếu đang chạy, sau đó chạy bản mới nhất
-            docker stop lito-container || true
-            docker rm lito-container || true
-            docker run -d --name lito-container -p 8000:8000 lito-backend
+                      # 4. Chạy container mới với chế độ tự hồi sinh
+                      docker run -d --name lito-container \
+                        --restart always \
+                        -p 8000:8000 \
+                        lito-backend
