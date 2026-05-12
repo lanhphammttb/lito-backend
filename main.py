@@ -8,6 +8,9 @@ from contextlib import asynccontextmanager
 from datetime import datetime, date, timedelta
 from typing import List, Optional
 
+import sentry_sdk
+from sentry_sdk.integrations.fastapi import FastApiIntegration
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -830,6 +833,15 @@ async def lifespan(app: FastAPI):
 
 
 # ===================== Create FastAPI Application =====================
+sentry_dsn = os.getenv("SENTRY_DSN")
+if sentry_dsn:
+    sentry_sdk.init(
+        dsn=sentry_dsn,
+        integrations=[FastApiIntegration()],
+        traces_sample_rate=float(os.getenv("SENTRY_TRACES_SAMPLE_RATE", "0.1")),
+        send_default_pii=True,
+    )
+
 app = FastAPI(
     title="Hala Handmade Business OS",
     description="Complete business management system for handmade businesses",

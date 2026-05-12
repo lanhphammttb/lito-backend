@@ -1,4 +1,4 @@
-name: Deploy backend to AWS Singapore (Docker)
+name: Deploy backend to AWS Singapore (Docker Compose)
 
 on:
   push:
@@ -20,28 +20,6 @@ jobs:
           key: ${{ secrets.SSH_KEY }}
           port: 22
           script: |
-                      cd /home/ubuntu/lito-backend
-                      git clean -fd
-                      git checkout .
-                      git pull origin main
-
-                      # 1. Build image mới
-                      docker build -t lito-backend .
-
-                      # 2. Dọn dẹp triệt để (The Clean Sweep)
-                      # Dừng và xóa container tên lito-container nếu có
-                      docker stop lito-container || true && docker rm lito-container || true
-
-                      # Tìm bất kỳ container nào đang chiếm cổng 8000 và "tiêu diệt" nó
-                      # Lệnh này tìm ID của container đang dùng port 8000 rồi stop/rm nó
-                      CONTAINER_ID=$(docker ps -q --filter "publish=8000")
-                      if [ ! -z "$CONTAINER_ID" ]; then
-                        docker stop $CONTAINER_ID || true
-                        docker rm $CONTAINER_ID || true
-                      fi
-
-                      # 3. Chạy container mới
-                      docker run -d --name lito-container \
-                        --restart always \
-                        -p 8000:8000 \
-                        lito-backend
+            cd /home/ubuntu/lito-backend
+            git pull origin main
+            docker compose up -d --build --remove-orphans
