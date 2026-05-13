@@ -79,6 +79,14 @@ class PaymentCreate(BaseModel):
             raise ValueError('Số tiền thanh toán phải lớn hơn 0')
         return v
 
+    @field_validator('status')
+    @classmethod
+    def status_allowed(cls, v: str) -> str:
+        allowed = {'pending', 'paid', 'completed', 'failed', 'refunded', 'cancelled'}
+        if v not in allowed:
+            raise ValueError('Trạng thái thanh toán không hợp lệ')
+        return v
+
 
 class ShippingUpdatePayload(BaseModel):
     """Shipping update payload."""

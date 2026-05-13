@@ -1,10 +1,9 @@
-﻿from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select
-from typing import List
 
 from config.database import engine
 from models.user import User
-from models.product import ProductImageTable, ProductImage
+from models.product import ProductImageTable
 from services.auth import get_current_user, require_admin
 
 router = APIRouter()

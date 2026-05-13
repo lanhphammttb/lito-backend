@@ -5,7 +5,7 @@ from typing import List, Optional
 from pydantic import BaseModel, ConfigDict
 
 # Load environment variables from .env file
-import os; load_dotenv(os.path.join(os.path.dirname(__file__), '../.env'))
+load_dotenv(os.path.join(os.path.dirname(__file__), "../.env"))
 
 # Environment variables
 JWT_SECRET = os.getenv("JWT_SECRET")

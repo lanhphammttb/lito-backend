@@ -80,6 +80,103 @@ class SecurityAndPersistenceTests(unittest.TestCase):
         response = self.client.post("/ai/analyze", json={"prompt": "hello"})
         self.assertEqual(response.status_code, 401)
 
+    def test_business_planning_routes_require_auth(self):
+        for method, path in (
+            ("get", "/ideas"),
+            ("post", "/ideas"),
+            ("get", "/experiments"),
+            ("post", "/experiments"),
+            ("get", "/strategy/okrs"),
+            ("post", "/strategy/okrs"),
+        ):
+            request = getattr(self.client, method)
+            response = request(path, json={}) if method == "post" else request(path)
+            self.assertEqual(response.status_code, 401, path)
+
+    def test_strategy_okr_persists(self):
+        response = self.client.post(
+            "/strategy/okrs",
+            headers=self.auth_headers,
+            json={
+                "title": "Grow repeat customers",
+                "quarter": "2026-Q2",
+                "key_results": [
+                    {"title": "Repeat orders", "target": 10, "current": 4, "unit": "orders"}
+                ],
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        okr_id = response.json()["id"]
+
+        list_response = self.client.get("/strategy/okrs", headers=self.auth_headers)
+        self.assertEqual(list_response.status_code, 200, list_response.text)
+        payload = list_response.json()
+        okr = next((item for item in payload["okrs"] if item["id"] == okr_id), None)
+        self.assertIsNotNone(okr)
+        self.assertEqual(okr["status"], "active")
+        self.assertEqual(okr["overall_progress"], 40.0)
+
+    def test_purchase_order_generate_persists_draft(self):
+        response = self.client.post(
+            "/inventory/purchase-orders/generate",
+            headers=self.auth_headers,
+            json={
+                "supplier_id": None,
+                "items": [
+                    {"material_id": 1, "quantity": 3, "unit_price": 12000},
+                    {"material_id": 2, "suggested_quantity": 2, "unit_price": 5000},
+                ],
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["status"], "draft")
+        self.assertEqual(payload["total_amount"], 46000)
+
+        detail = self.client.get(
+            f"/inventory/purchase-orders/{payload['id']}",
+            headers=self.auth_headers,
+        )
+        self.assertEqual(detail.status_code, 200, detail.text)
+        self.assertEqual(detail.json()["computed_total"], 46000)
+
+    def test_creating_multiple_orders_uses_distinct_ids(self):
+        product_response = self.client.post(
+            "/products",
+            headers=self.auth_headers,
+            json={
+                "name": "Order ID Product",
+                "base_price": 50000,
+                "difficulty": 1,
+                "time_minutes": 10,
+                "materials": [],
+            },
+        )
+        self.assertEqual(product_response.status_code, 200, product_response.text)
+        product_id = product_response.json()["id"]
+
+        order_ids = []
+        for idx in range(2):
+            response = self.client.post(
+                "/orders",
+                headers=self.auth_headers,
+                json={
+                    "date": f"2026-02-0{idx + 1}",
+                    "channel": "web",
+                    "order_lines": [
+                        {
+                            "product_id": product_id,
+                            "quantity": 1,
+                            "unit_price": 50000,
+                        }
+                    ],
+                },
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            order_ids.append(response.json()["id"])
+
+        self.assertEqual(len(set(order_ids)), 2)
+
     def test_variant_review_payment_and_return_persist(self):
         product_response = self.client.post(
             "/products",
@@ -161,6 +258,11 @@ class SecurityAndPersistenceTests(unittest.TestCase):
             },
         )
         self.assertEqual(payment_response.status_code, 200, payment_response.text)
+        paid_order_response = self.client.get(
+            f"/orders/{order_id}", headers=self.auth_headers
+        )
+        self.assertEqual(paid_order_response.status_code, 200)
+        self.assertEqual(paid_order_response.json()["payment_status"], "paid")
 
         return_response = self.client.post(
             f"/orders/{order_id}/returns",
@@ -175,13 +277,13 @@ class SecurityAndPersistenceTests(unittest.TestCase):
         self.assertEqual(return_response.status_code, 200, return_response.text)
 
         payments_response = self.client.get(
-            "/payments", headers=self.auth_headers, params={"order_id": order_id}
+            "/orders/payments", headers=self.auth_headers, params={"order_id": order_id}
         )
         self.assertEqual(payments_response.status_code, 200)
         self.assertEqual(len(payments_response.json()), 1)
 
         returns_response = self.client.get(
-            "/returns", headers=self.auth_headers, params={"order_id": order_id}
+            "/orders/returns", headers=self.auth_headers, params={"order_id": order_id}
         )
         self.assertEqual(returns_response.status_code, 200)
         self.assertEqual(len(returns_response.json()), 1)

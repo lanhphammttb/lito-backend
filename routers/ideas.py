@@ -1,47 +1,40 @@
 """Ideas router."""
-from typing import List
-from fastapi import APIRouter, HTTPException
+from datetime import datetime
+
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict
+from sqlmodel import Session, select
+
+from config.database import engine
+from models.idea import IdeaTable
 from models.user import User
+from services.auth import get_current_user
 
 
-class DummyModel(BaseModel):
+class IdeaCreate(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
-class Idea(DummyModel): pass
-class IdeaCreate(DummyModel): pass
+class IdeaUpdate(BaseModel):
+    model_config = ConfigDict(extra="allow")
 
 
 router = APIRouter()
-current_user = User(id=1, email="admin@hala.vn", role="admin", name="Admin", password_hash="dummy")
-from datetime import datetime
-from sqlmodel import Session, select
-from config.database import engine
-from models.idea import IdeaTable
-
-def set_data_stores(id_, p):
-    pass
-
-
-def next_id(collection) -> int:
-    return max((item.id for item in collection), default=0) + 1
 
 
 @router.get("/ideas")
-async def list_ideas():
+async def list_ideas(user: User = Depends(get_current_user)):
     with Session(engine) as session:
         return [r.model_dump() for r in session.exec(select(IdeaTable)).all()]
 
 
 @router.post("/ideas")
-async def create_idea(payload: IdeaCreate):
+async def create_idea(payload: IdeaCreate, user: User = Depends(get_current_user)):
+    data = payload.model_dump()
+    if not data.get("name"):
+        raise HTTPException(status_code=422, detail="name là bắt buộc")
     with Session(engine) as session:
-        row = IdeaTable(
-            **payload.model_dump(),
-            created_at=datetime.utcnow(),
-            created_by=current_user.id,
-        )
+        row = IdeaTable(**data, created_at=datetime.utcnow(), created_by=user.id)
         session.add(row)
         session.commit()
         session.refresh(row)
@@ -49,19 +42,15 @@ async def create_idea(payload: IdeaCreate):
 
 
 @router.put("/ideas/{idea_id}")
-async def update_idea(idea_id: int, payload: Idea):
-    if hasattr(payload, 'id') and payload.id != idea_id:
-        raise HTTPException(status_code=400, detail="Không được đổi id")
+async def update_idea(idea_id: int, payload: IdeaUpdate, user: User = Depends(get_current_user)):
     with Session(engine) as session:
         row = session.get(IdeaTable, idea_id)
         if not row:
             raise HTTPException(status_code=404, detail="Idea không tồn tại")
-        
-        update_data = payload.model_dump(exclude_unset=True)
-        for key, value in update_data.items():
-            if key != "id" and key != "created_by" and key != "created_at":
+        for key, value in payload.model_dump(exclude_unset=True).items():
+            if key not in ("id", "created_by", "created_at"):
                 setattr(row, key, value)
-        row.updated_by = current_user.id
+        row.updated_by = user.id
         session.add(row)
         session.commit()
         session.refresh(row)
@@ -69,7 +58,7 @@ async def update_idea(idea_id: int, payload: Idea):
 
 
 @router.delete("/ideas/{idea_id}")
-async def delete_idea(idea_id: int):
+async def delete_idea(idea_id: int, user: User = Depends(get_current_user)):
     with Session(engine) as session:
         row = session.get(IdeaTable, idea_id)
         if not row:

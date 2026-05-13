@@ -24,7 +24,7 @@ from .category import Category, CategoryTable
 from .season import Season, SeasonTable
 from .task import Task, TaskTable
 from .issue import Issue, IssueTable, IssueComment, IssueCommentTable
-from .idea import Idea, IdeaTable
+from .idea import IdeaTable
 from .experiment import Experiment, ExperimentTable
 from .goal import Goal, GoalTable
 from .activity import ActivityLog, ActivityLogTable, AuditLogTable
@@ -54,7 +54,7 @@ __all__ = [
     "Season", "SeasonTable",
     "Task", "TaskTable",
     "Issue", "IssueTable", "IssueComment", "IssueCommentTable",
-    "Idea", "IdeaTable",
+    "IdeaTable",
     "Experiment", "ExperimentTable",
     "Goal", "GoalTable",
     "ActivityLog", "ActivityLogTable", "AuditLogTable",

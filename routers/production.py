@@ -16,10 +16,8 @@ from services.stock_ledger import (
     calculate_product_material_requirements,
     has_reserved_materials_for_order,
     consume_reserved_materials_for_order,
-    reserve_materials_for_job,
     release_materials_for_job,
     consume_materials_for_job,
-    validate_material_availability,
     _material_state,
     _reserved_balance_for,
 )
@@ -123,7 +121,7 @@ async def create_production_job(
     """
     Tạo production job ở trạng thái 'planned'. Chưa đụng kho.
 
-    MTO (có order_id): đơn phải confirmed/producing.
+    MTO (có order_id): đơn phải confirmed/processing.
     MTS (không có order_id): làm trước để dự trữ.
 
     Kho chỉ bị trừ khi job chuyển sang in_progress.
@@ -133,10 +131,10 @@ async def create_production_job(
 
     if not is_mts:
         order = find_order(payload.order_id)
-        if order.status not in {"confirmed", "producing"}:
+        if order.status not in {"confirmed", "processing", "producing"}:
             raise HTTPException(
                 status_code=400,
-                detail=f"Đơn #{payload.order_id} cần ở trạng thái confirmed hoặc producing (hiện tại: {order.status})"
+                detail=f"Đơn #{payload.order_id} cần ở trạng thái confirmed hoặc processing (hiện tại: {order.status})"
             )
 
     requirements = calculate_product_material_requirements(product, payload.quantity)

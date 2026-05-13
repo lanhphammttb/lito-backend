@@ -1,9 +1,9 @@
 """Experiments router."""
-from typing import List
 from datetime import datetime
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict
 from models.user import User
+from services.auth import get_current_user
 
 
 class DummyModel(BaseModel):
@@ -16,8 +16,6 @@ class ExperimentUpdate(DummyModel): pass
 
 
 router = APIRouter()
-current_user = User(id=1, email="admin@hala.vn", role="admin", name="Admin", password_hash="dummy")
-from datetime import datetime
 from sqlmodel import Session, select
 from config.database import engine
 from models.experiment import ExperimentTable
@@ -31,17 +29,17 @@ def next_id(collection) -> int:
 
 
 @router.get("/experiments")
-async def list_experiments():
+async def list_experiments(user: User = Depends(get_current_user)):
     with Session(engine) as session:
         return [r.model_dump() for r in session.exec(select(ExperimentTable)).all()]
 
 
 @router.post("/experiments")
-async def create_experiment(payload: ExperimentCreate):
+async def create_experiment(payload: ExperimentCreate, user: User = Depends(get_current_user)):
     with Session(engine) as session:
         row = ExperimentTable(
             **payload.model_dump(),
-            created_by=current_user.id,
+            created_by=user.id,
             created_at=datetime.utcnow(),
         )
         session.add(row)
@@ -51,7 +49,7 @@ async def create_experiment(payload: ExperimentCreate):
 
 
 @router.put("/experiments/{exp_id}")
-async def update_experiment(exp_id: int, payload: ExperimentUpdate):
+async def update_experiment(exp_id: int, payload: ExperimentUpdate, user: User = Depends(get_current_user)):
     with Session(engine) as session:
         row = session.get(ExperimentTable, exp_id)
         if not row:
@@ -68,7 +66,7 @@ async def update_experiment(exp_id: int, payload: ExperimentUpdate):
 
 
 @router.delete("/experiments/{exp_id}")
-async def delete_experiment(exp_id: int):
+async def delete_experiment(exp_id: int, user: User = Depends(get_current_user)):
     with Session(engine) as session:
         row = session.get(ExperimentTable, exp_id)
         if not row:

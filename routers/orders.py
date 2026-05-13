@@ -1,7 +1,7 @@
 """Order routes."""
 from typing import List, Optional
-from datetime import datetime, date
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
+from datetime import date
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from sqlmodel import Session
 
 import json
@@ -187,8 +187,56 @@ def save_payment_sql(payment: Payment) -> Payment:
             created_at=row.created_at,
         )
 
+
+PAID_PAYMENT_STATUSES = {"paid", "completed"}
+
+
+def _order_payable_amount(order: Order) -> float:
+    gross = sum(line.unit_price * line.quantity for line in order.order_lines)
+    return max(0, round(gross + (order.shipping_fee or 0) - (order.discount or 0), 2))
+
+
+def refresh_order_payment_status(order_id: int) -> str:
+    """Recompute and persist order payment_status from stored payment records."""
+    order = find_order(order_id)
+    payable_amount = _order_payable_amount(order)
+
+    with Session(engine) as session:
+        rows = session.exec(
+            select(PaymentTable).where(PaymentTable.order_id == order_id)
+        ).all()
+        paid_total = sum(
+            row.amount
+            for row in rows
+            if (row.status or "").lower() in PAID_PAYMENT_STATUSES
+        )
+
+        if payable_amount <= 0:
+            next_status = "paid" if paid_total > 0 else "unpaid"
+        elif paid_total >= payable_amount:
+            next_status = "paid"
+        elif paid_total > 0:
+            next_status = "partial"
+        else:
+            next_status = "unpaid"
+
+        row = session.get(OrderTable, order_id)
+        if row:
+            row.payment_status = next_status
+            row.updated_at = utcnow()
+            session.add(row)
+            session.commit()
+
+    for cached in orders:
+        if cached.id == order_id:
+            cached.payment_status = next_status
+            cached.updated_at = utcnow()
+            break
+
+    return next_status
+
 router = APIRouter()
-RESERVE_STATUSES = {"confirmed", "producing"}
+RESERVE_STATUSES = {"confirmed", "processing", "producing"}
 
 
 SHIPPED_STATUSES = {"delivered", "completed"}
@@ -218,7 +266,7 @@ def _apply_stock_transition(old_status: str, new_status: str, order, user):
     Duy nhất một nơi quyết định thao tác kho khi đổi status đơn hàng.
 
     NVL (nguyên vật liệu):
-    - confirmed / producing  → RESERVE  (giữ chỗ NVL)
+    - confirmed / processing → RESERVE  (giữ chỗ NVL)
     - cancelled              → RELEASE  (trả lại available)
 
     Thành phẩm (finished_qty):
@@ -471,7 +519,9 @@ async def create_order(
     validate_order_payload(payload)
     apply_promo(payload)
 
-    new_id = max((o.id for o in orders), default=0) + 1
+    with Session(engine) as session:
+        max_id_val = session.exec(select(OrderTable.id).order_by(OrderTable.id.desc())).first()
+        new_id = (max_id_val or 0) + 1
     now = utcnow()
 
     order = Order(
@@ -503,6 +553,7 @@ async def create_order(
         reserve_stock_for_order(order, user)
 
     save_order_sql(order)
+    orders.append(order)
     upsert_mongo("orders", order.model_dump(mode="json") if hasattr(order, "model_dump") else order.__dict__)
     log_activity(user.id, "order", new_id, "create", {"status": order.status})
     await create_audit_log(user, "CREATE", "orders", new_id, None, order.__dict__, request)
@@ -746,12 +797,13 @@ async def create_payment(
         method=payload.method,
         status=payload.status,
         transaction_id=payload.transaction_id,
-        paid_date=utcnow() if payload.status == "paid" else None,
+        paid_date=utcnow() if payload.status in PAID_PAYMENT_STATUSES else None,
         notes=payload.notes,
         created_at=utcnow(),
     )
     persisted_payment = save_payment_sql(payment)
     payments.append(persisted_payment)
+    refresh_order_payment_status(order_id)
 
     log_activity(user.id, "payment", persisted_payment.id, "create", {"order_id": order_id, "amount": payload.amount})
 
