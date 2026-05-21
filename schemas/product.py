@@ -55,6 +55,7 @@ class ProductImageCreate(BaseModel):
     type: str = "image"
     display_order: int = 0
     is_primary: bool = False
+    is_public: bool = True
 
 
 class ProductReviewCreate(BaseModel):

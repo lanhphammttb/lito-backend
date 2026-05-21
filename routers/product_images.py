@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from sqlmodel import Session, select
 
 from config.database import engine
@@ -7,6 +8,26 @@ from models.product import ProductImageTable
 from services.auth import get_current_user, require_admin
 
 router = APIRouter()
+
+
+class ProductImageCreate(BaseModel):
+    product_id: int
+    url: str
+    type: str = "image"
+    display_order: int = 0
+    is_primary: bool = False
+    is_public: bool = True
+
+
+@router.post('')
+async def create_product_image(payload: ProductImageCreate, current_user: User = Depends(get_current_user)):
+    require_admin(current_user)
+    with Session(engine) as session:
+        img = ProductImageTable(**payload.model_dump())
+        session.add(img)
+        session.commit()
+        session.refresh(img)
+        return img
 
 @router.put('/{image_id}/set-primary')
 async def set_primary_product_image(image_id: int, current_user: User = Depends(get_current_user)):
