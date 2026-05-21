@@ -9,15 +9,21 @@ from config.database import engine
 from models.order import OrderTable, OrderLine
 from models.user import User
 from services.auth import get_current_user
-from google.analytics.data_v1beta import BetaAnalyticsDataClient
-from google.analytics.data_v1beta.types import (
-    DateRange,
-    Dimension,
-    Metric,
-    RunReportRequest,
-    RunRealtimeReportRequest,
-)
-from google.oauth2 import service_account
+
+try:
+    from google.analytics.data_v1beta import BetaAnalyticsDataClient
+    from google.analytics.data_v1beta.types import (
+        DateRange,
+        Dimension,
+        Metric,
+        RunReportRequest,
+        RunRealtimeReportRequest,
+    )
+    from google.oauth2 import service_account
+except ModuleNotFoundError:
+    BetaAnalyticsDataClient = None
+    DateRange = Dimension = Metric = RunReportRequest = RunRealtimeReportRequest = None
+    service_account = None
 
 router = APIRouter(prefix="/ga4", tags=["GA4 Analytics"])
 
@@ -26,6 +32,11 @@ _PROPERTY_ID = "properties/536976944"
 
 
 def _client() -> BetaAnalyticsDataClient:
+    if BetaAnalyticsDataClient is None or service_account is None:
+        raise HTTPException(
+            status_code=503,
+            detail="GA4 dependencies are not installed. Install google-analytics-data.",
+        )
     creds = service_account.Credentials.from_service_account_file(
         _CREDENTIALS_PATH,
         scopes=["https://www.googleapis.com/auth/analytics.readonly"],
