@@ -293,6 +293,7 @@ async def list_products(
             
             output.append({
                 **p.model_dump(),
+                **cost_data,
                 "computed": cost_data,
                 "images": [img.model_dump() for img in images],
                 "variants": [v.model_dump() for v in variants],
@@ -400,6 +401,7 @@ async def get_product(
 
         return {
             **product.model_dump(),
+            **cost_data,
             "computed": cost_data,
             "images": [img.model_dump() for img in images],
             "variants": [v.model_dump() for v in variants],

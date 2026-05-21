@@ -773,7 +773,6 @@ async def create_return(
         created_at=utcnow(),
     )
     persisted_return = save_return_sql(return_obj)
-    order_returns.append(persisted_return)
 
     log_activity(user.id, "order_return", persisted_return.id, "create", {"order_id": order_id})
 
@@ -802,7 +801,6 @@ async def create_payment(
         created_at=utcnow(),
     )
     persisted_payment = save_payment_sql(payment)
-    payments.append(persisted_payment)
     refresh_order_payment_status(order_id)
 
     log_activity(user.id, "payment", persisted_payment.id, "create", {"order_id": order_id, "amount": payload.amount})

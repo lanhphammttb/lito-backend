@@ -44,8 +44,8 @@ class Settings(BaseModel):
     profit_share_mode: str = "50-50"
     share_user_a: float = 50.0
     share_user_b: float = 50.0
-    business_name: Optional[str] = "Hala Handmade"
-    shop_name: Optional[str] = "Hala Handmade"
+    business_name: Optional[str] = "LITO Handmade"
+    shop_name: Optional[str] = "LITO Handmade"
     currency: str = "VND"
     business_address: Optional[str] = None
     business_logo: Optional[str] = None

@@ -196,13 +196,33 @@ async def add_stock_movement(
     """Add stock movement (in/out/adjustment)."""
     material = find_material(material_id)
 
-    from sqlmodel import Session, select
+    created_at = datetime.utcnow()
+
+    # Update material stock
+    material.stock_quantity += payload.quantity_change
+    save_material_sql(material)
+
+    # Save movement to SQL and use DB-generated ID
+    from sqlmodel import Session
     with Session(engine) as session:
-        max_id_val = session.exec(select(StockMovementTable.id).order_by(StockMovementTable.id.desc())).first()
-        new_id = (max_id_val or 0) + 1
-        
+        row = StockMovementTable(
+            material_id=material_id,
+            quantity_change=payload.quantity_change,
+            movement_type=payload.movement_type,
+            reference_type=payload.reference_type,
+            reference_id=payload.reference_id,
+            batch_id=payload.batch_id,
+            expiry_date=payload.expiry_date,
+            user_id=user.id,
+            note=payload.note,
+            created_at=created_at,
+        )
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+
     movement = StockMovement(
-        id=new_id,
+        id=row.id,
         material_id=material_id,
         quantity_change=payload.quantity_change,
         movement_type=payload.movement_type,
@@ -212,28 +232,8 @@ async def add_stock_movement(
         expiry_date=payload.expiry_date,
         user_id=user.id,
         note=payload.note,
-        created_at=datetime.utcnow(),
+        created_at=created_at,
     )
-
-    # Update material stock
-    material.stock_quantity += payload.quantity_change
-    save_material_sql(material)
-
-    # Save movement to SQL
-    with Session(engine) as session:
-        session.add(StockMovementTable(
-            material_id=material_id,
-            quantity_change=movement.quantity_change,
-            movement_type=movement.movement_type,
-            reference_type=movement.reference_type,
-            reference_id=movement.reference_id,
-            batch_id=movement.batch_id,
-            expiry_date=movement.expiry_date,
-            user_id=movement.user_id,
-            note=movement.note,
-            created_at=movement.created_at,
-        ))
-        session.commit()
 
     log_activity(user.id, "material", material_id, "stock_movement", {
         "change": payload.quantity_change,

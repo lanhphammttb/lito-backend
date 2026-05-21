@@ -1,4 +1,4 @@
-# Hala Handmade Backend - Setup Guide
+# LITO Handmade Backend - Setup Guide
 
 Dự án FastAPI backend (đã được cấu trúc lại Modular)
 

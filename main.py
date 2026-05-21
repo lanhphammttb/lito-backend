@@ -1,4 +1,4 @@
-"""Hala Handmade Business OS ASGI entrypoint."""
+"""LITO Handmade Business OS ASGI entrypoint."""
 
 from app_bootstrap import lifespan
 from app_factory import create_app

@@ -45,9 +45,10 @@ from routers.strategy_router import router as strategy_router
 from routers.system import router as system_router, websocket_endpoint
 from routers.tasks import router as tasks_router
 from routers.upload import router as upload_router
+from routers.ga4_router import router as ga4_router
 
 
-APP_TITLE = "Hala Handmade Business OS"
+APP_TITLE = "LITO Handmade Business OS"
 APP_DESCRIPTION = "Complete business management system for handmade businesses"
 APP_VERSION = "2.0.0"
 
@@ -89,6 +90,7 @@ def include_routers(app: FastAPI) -> None:
     app.include_router(dashboard_router, prefix="/dashboard", tags=["Dashboard"])
     app.include_router(settings_router, prefix="/settings", tags=["Settings"])
     app.include_router(upload_router, prefix="/upload", tags=["Upload"])
+    app.include_router(ga4_router)
     app.include_router(product_images_router, prefix="/product-images", tags=["Product Images"])
     app.include_router(activity_router, prefix="/activity", tags=["Activity"])
     app.include_router(tasks_router, prefix="/tasks", tags=["Tasks"])

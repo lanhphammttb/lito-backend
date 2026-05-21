@@ -104,4 +104,4 @@ async def health_check():
 @router.get("")
 async def root():
     """Root endpoint."""
-    return {"name": "Hala Handmade Business OS", "version": "2.0.0", "docs": "/docs"}
+    return {"name": "LITO Handmade Business OS", "version": "2.0.0", "docs": "/docs"}

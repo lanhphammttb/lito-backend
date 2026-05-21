@@ -19,6 +19,9 @@ __pycache__/
 .env
 .env.local
 
+# Service account credentials (never commit private keys)
+config/ga4_credentials.json
+
 # IDE
 .vscode/
 .idea/

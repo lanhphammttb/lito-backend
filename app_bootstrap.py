@@ -763,7 +763,7 @@ def load_data_from_sql():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
-    print("🚀 Starting Hala Handmade Business OS...")
+    print("🚀 Starting LITO Handmade Business OS...")
     auto_init_db = os.getenv("AUTO_INIT_DB_ON_STARTUP", "false").lower() == "true"
     auto_seed_data = os.getenv("AUTO_SEED_DATA_ON_STARTUP", "false").lower() == "true"
 
