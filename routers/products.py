@@ -730,9 +730,9 @@ async def get_facebook_insights(
         except Exception:
             raise HTTPException(status_code=400, detail="Không thể đọc link bài viết. Vui lòng dùng ID số dạng: 877324125473060_122129...")
 
-    # pfbid không resolve được qua API
-    if post_id.startswith("pfbid"):
-        raise HTTPException(status_code=400, detail="Link dạng pfbid không được Facebook API hỗ trợ. Dùng ID số từ Graph API Explorer: /{page_id}/posts?fields=id,message")
+    # pfbid format: ghép {page_id}_{pfbid} để gọi Meta Graph API
+    if post_id.startswith("pfbid") and page_id:
+        post_id = f"{page_id}_{post_id}"
 
     # Nếu chỉ là post_id số thuần (không có page_id_), tự ghép
     if re.fullmatch(r"\d+", post_id) and page_id:
