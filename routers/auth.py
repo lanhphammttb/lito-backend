@@ -6,7 +6,7 @@ from sqlmodel import Session, select
 import httpx
 
 from config.database import engine
-from config.settings import settings as app_settings, FRONTEND_URL
+from config.settings import settings as app_settings, FRONTEND_URL, FACEBOOK_REDIRECT_URI
 from models.settings_table import SettingsTable
 from schemas.auth import LoginRequest, TokenResponse
 from services.auth import (
@@ -145,7 +145,7 @@ async def facebook_oauth_start(request: Request):
     app_id = getattr(app_settings, "facebook_app_id", None)
     if not app_id:
         return RedirectResponse(f"{FRONTEND_URL}/settings?facebook_error=Chưa+cấu+hình+Facebook+App+ID")
-    redirect_uri = str(request.base_url).rstrip("/") + "/auth/facebook/callback"
+    redirect_uri = FACEBOOK_REDIRECT_URI
     scope = "pages_show_list,pages_read_engagement,pages_read_user_content,instagram_basic,instagram_manage_insights"
     fb_url = (
         f"https://www.facebook.com/dialog/oauth"
@@ -168,7 +168,7 @@ async def facebook_oauth_callback(request: Request, code: str = None, error: str
     if not app_id or not app_secret:
         return RedirectResponse(f"{FRONTEND_URL}/settings?facebook_error=Missing+app+credentials")
 
-    redirect_uri = str(request.base_url).rstrip("/") + "/auth/facebook/callback"
+    redirect_uri = FACEBOOK_REDIRECT_URI
 
     async with httpx.AsyncClient(timeout=15.0) as client:
         # Exchange code for short-lived user token

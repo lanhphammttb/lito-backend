@@ -98,6 +98,7 @@ _SECRET_FIELDS = {
 }
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
+FACEBOOK_REDIRECT_URI = os.getenv("FACEBOOK_REDIRECT_URI", "http://localhost:8000/auth/facebook/callback")
 
 
 # Constants
