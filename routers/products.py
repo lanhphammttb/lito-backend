@@ -743,7 +743,7 @@ async def get_facebook_insights(
             meta_resp = await client.get(
                 post_url,
                 params={
-                    "fields": "message,created_time,shares,comments.summary(true),permalink_url,full_picture,reactions.summary(true),reactions.type(LIKE).summary(true).limit(0) as like,reactions.type(LOVE).summary(true).limit(0) as love,reactions.type(HAHA).summary(true).limit(0) as haha,reactions.type(WOW).summary(true).limit(0) as wow,reactions.type(SAD).summary(true).limit(0) as sad,reactions.type(ANGRY).summary(true).limit(0) as angry",
+                    "fields": "message,created_time,shares,comments.summary(true),permalink_url,full_picture,like:reactions.type(LIKE).limit(0).summary(total_count),love:reactions.type(LOVE).limit(0).summary(total_count),haha:reactions.type(HAHA).limit(0).summary(total_count),wow:reactions.type(WOW).limit(0).summary(total_count),sad:reactions.type(SAD).limit(0).summary(total_count),angry:reactions.type(ANGRY).limit(0).summary(total_count)",
                     "access_token": page_access_token
                 }
             )
@@ -767,15 +767,15 @@ async def get_facebook_insights(
                     if values:
                         parsed_insights[item["name"]] = values[0].get("value", 0)
 
-            total_reactions = meta_data.get("reactions", {}).get("summary", {}).get("total_count", 0)
             reactions = {
-                "like": meta_data.get("like", {}).get("summary", {}).get("total_count", 0),
-                "love": meta_data.get("love", {}).get("summary", {}).get("total_count", 0),
-                "haha": meta_data.get("haha", {}).get("summary", {}).get("total_count", 0),
-                "wow": meta_data.get("wow", {}).get("summary", {}).get("total_count", 0),
-                "sorry": meta_data.get("sad", {}).get("summary", {}).get("total_count", 0),
+                "like":  meta_data.get("like",  {}).get("summary", {}).get("total_count", 0),
+                "love":  meta_data.get("love",  {}).get("summary", {}).get("total_count", 0),
+                "haha":  meta_data.get("haha",  {}).get("summary", {}).get("total_count", 0),
+                "wow":   meta_data.get("wow",   {}).get("summary", {}).get("total_count", 0),
+                "sorry": meta_data.get("sad",   {}).get("summary", {}).get("total_count", 0),
                 "anger": meta_data.get("angry", {}).get("summary", {}).get("total_count", 0),
             }
+            total_reactions = sum(reactions.values())
 
             return {
                 "post_id": post_id,
