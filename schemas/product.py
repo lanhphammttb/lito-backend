@@ -23,6 +23,7 @@ class ProductBase(BaseModel):
     marketing_cost: float = 0
     platform_fee_percent: float = 0
     cost_breakdown: Optional[Dict[str, float]] = None
+    facebook_post_id: Optional[str] = None
 
 
 class ProductCreate(ProductBase):

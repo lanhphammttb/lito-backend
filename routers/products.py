@@ -50,6 +50,7 @@ def save_product_sql(product):
             row.platform_fee_percent = product.platform_fee_percent
             row.cost_breakdown_json = json.dumps(product.cost_breakdown) if product.cost_breakdown else None
             row.finished_qty = getattr(product, "finished_qty", 0) or 0
+            row.facebook_post_id = getattr(product, "facebook_post_id", None)
             row.updated_at = product.updated_at
         else:
             row = ProductTable(
@@ -72,6 +73,7 @@ def save_product_sql(product):
                 platform_fee_percent=product.platform_fee_percent,
                 cost_breakdown_json=json.dumps(product.cost_breakdown) if product.cost_breakdown else None,
                 finished_qty=getattr(product, "finished_qty", 0) or 0,
+                facebook_post_id=getattr(product, "facebook_post_id", None),
                 created_by=product.created_by,
                 created_at=product.created_at,
                 updated_at=product.updated_at,
@@ -446,6 +448,7 @@ async def create_product(
         marketing_cost=payload.marketing_cost or 0,
         platform_fee_percent=payload.platform_fee_percent or 0,
         cost_breakdown=payload.cost_breakdown,
+        facebook_post_id=payload.facebook_post_id,
         created_at=now,
         updated_at=now,
     )
@@ -499,6 +502,7 @@ async def update_product(
     product.marketing_cost = payload.marketing_cost or 0
     product.platform_fee_percent = payload.platform_fee_percent or 0
     product.cost_breakdown = payload.cost_breakdown
+    product.facebook_post_id = payload.facebook_post_id
     product.updated_at = utcnow()
 
     # Update materials
@@ -647,3 +651,125 @@ async def adjust_finished_qty(
         "note": payload.get("note", "")
     })
     return {"ok": True, "product_id": product_id, "finished_qty": product.finished_qty}
+
+
+@router.put("/{product_id}/facebook-post-id")
+async def update_facebook_post_id(
+    product_id: int,
+    payload: dict,
+    user: User = Depends(get_current_user)
+):
+    """Update just the facebook_post_id for a product."""
+    require_admin(user)
+    product = find_product(product_id)
+    post_id = payload.get("facebook_post_id")
+    if post_id is not None:
+        post_id = post_id.strip()
+        if not post_id:
+            post_id = None
+
+    product.facebook_post_id = post_id
+    product.updated_at = utcnow()
+    save_product_sql(product)
+    upsert_mongo("products", product.model_dump(mode="json") if hasattr(product, "model_dump") else product.__dict__)
+    log_activity(user.id, "product", product_id, "link_facebook_post", {"facebook_post_id": post_id})
+    return {"ok": True, "facebook_post_id": post_id}
+
+
+@router.get("/{product_id}/facebook-insights")
+async def get_facebook_insights(
+    product_id: int,
+    user: User = Depends(get_current_user)
+):
+    """Retrieve details and insights of the linked Facebook post from Graph API."""
+    product = find_product(product_id)
+    post_id = product.facebook_post_id
+    if not post_id:
+        raise HTTPException(status_code=400, detail="Sản phẩm chưa được liên kết với bài viết Facebook nào")
+
+    page_access_token = settings.facebook_page_access_token
+    if not page_access_token:
+        raise HTTPException(status_code=400, detail="Chưa cấu hình Facebook Page Access Token trong Cấu hình")
+
+    # Simulation fallback for development or testing
+    if page_access_token.startswith("mock") or post_id.startswith("mock") or post_id == "12345":
+        return {
+            "post_id": post_id,
+            "message": "Đây là bài viết mô phỏng giới thiệu sản phẩm mới tinh xảo handmade LITO! Cảm ơn cả nhà đã ủng hộ ❤️ #lito #handmade",
+            "created_time": utcnow().isoformat(),
+            "permalink_url": "https://facebook.com/litohandmade/posts/12345",
+            "full_picture": "https://placehold.co/600x400?text=LITO+Handmade+Mock+Post",
+            "shares_count": 45,
+            "comments_count": 89,
+            "impressions": 12450,
+            "reach": 8900,
+            "engaged_users": 1200,
+            "clicks": 450,
+            "reactions": {
+                "like": 320,
+                "love": 150,
+                "haha": 5,
+                "wow": 12,
+                "sorry": 0,
+                "anger": 0
+            },
+            "reactions_count": 487
+        }
+
+    import httpx
+    post_url = f"https://graph.facebook.com/v19.0/{post_id}"
+    insights_url = f"https://graph.facebook.com/v19.0/{post_id}/insights"
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            meta_resp = await client.get(
+                post_url,
+                params={"fields": "message,created_time,shares,comments.summary(true),permalink_url,full_picture", "access_token": page_access_token}
+            )
+
+            if meta_resp.status_code != 200:
+                err_detail = meta_resp.json().get("error", {}).get("message", "Lỗi Graph API")
+                raise HTTPException(status_code=meta_resp.status_code, detail=f"Lỗi Facebook API: {err_detail}")
+
+            meta_data = meta_resp.json()
+
+            metrics = "post_impressions,post_impressions_unique,post_engaged_users,post_reactions_by_type_total,post_clicks"
+            insights_resp = await client.get(
+                insights_url,
+                params={"metric": metrics, "access_token": page_access_token}
+            )
+
+            insights_data = []
+            if insights_resp.status_code == 200:
+                insights_data = insights_resp.json().get("data", [])
+            else:
+                print(f"Warning: Failed to fetch post insights: {insights_resp.text}")
+
+            parsed_insights = {}
+            for item in insights_data:
+                name = item.get("name")
+                values = item.get("values", [])
+                if values:
+                    val = values[0].get("value")
+                    parsed_insights[name] = val
+
+            reactions = parsed_insights.get("post_reactions_by_type_total", {})
+            total_reactions = sum(reactions.values()) if isinstance(reactions, dict) else 0
+
+            return {
+                "post_id": post_id,
+                "message": meta_data.get("message", ""),
+                "created_time": meta_data.get("created_time"),
+                "permalink_url": meta_data.get("permalink_url"),
+                "full_picture": meta_data.get("full_picture"),
+                "shares_count": meta_data.get("shares", {}).get("count", 0),
+                "comments_count": meta_data.get("comments", {}).get("summary", {}).get("total_count", 0),
+                "impressions": parsed_insights.get("post_impressions", 0),
+                "reach": parsed_insights.get("post_impressions_unique", 0),
+                "engaged_users": parsed_insights.get("post_engaged_users", 0),
+                "clicks": parsed_insights.get("post_clicks", 0),
+                "reactions": reactions,
+                "reactions_count": total_reactions
+            }
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=500, detail=f"Không thể kết nối tới Facebook Graph API: {str(exc)}")

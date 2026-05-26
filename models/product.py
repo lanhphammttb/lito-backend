@@ -39,6 +39,7 @@ class Product(BaseModel):
     demand_score: float = 0
     feasibility_score: float = 0
     finished_qty: int = 0
+    facebook_post_id: Optional[str] = None
     created_by: Optional[int] = None
     updated_by: Optional[int] = None
     created_at: datetime = Field(default_factory=utcnow)
@@ -70,6 +71,7 @@ class ProductTable(SQLModel, table=True):
     demand_score: float = 0
     feasibility_score: float = 0
     finished_qty: int = 0
+    facebook_post_id: Optional[str] = SQLField(default=None)
     created_by: Optional[int] = None
     updated_by: Optional[int] = None
     created_at: datetime = SQLField(default_factory=utcnow)

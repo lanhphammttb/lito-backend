@@ -35,3 +35,5 @@ class SettingsTable(SQLModel, table=True):
     lazada_app_key: Optional[str] = None
     lazada_app_secret: Optional[str] = None
     lazada_access_token: Optional[str] = None
+    facebook_page_id: Optional[str] = None
+    facebook_page_access_token: Optional[str] = None

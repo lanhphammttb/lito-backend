@@ -118,6 +118,9 @@ def run_schema_migrations():
         )
         """,
         "CREATE INDEX IF NOT EXISTS ix_strategy_items_kind ON strategy_items (kind)",
+        "ALTER TABLE products ADD COLUMN facebook_post_id TEXT",
+        "ALTER TABLE settings ADD COLUMN facebook_page_id TEXT",
+        "ALTER TABLE settings ADD COLUMN facebook_page_access_token TEXT",
     ]
     with Session(engine) as session:
         for sql in migrations:
@@ -429,6 +432,7 @@ def load_data_from_sql():
                 finished_qty=getattr(row, "finished_qty", 0) or 0,
                 created_by=row.created_by,
                 updated_by=row.updated_by,
+                facebook_post_id=getattr(row, "facebook_post_id", None),
                 materials=mat_usages, created_at=row.created_at, updated_at=row.updated_at,
             ))
 

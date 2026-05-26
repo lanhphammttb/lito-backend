@@ -68,6 +68,9 @@ class Settings(BaseModel):
     lazada_app_key: Optional[str] = None
     lazada_app_secret: Optional[str] = None
     lazada_access_token: Optional[str] = None
+    # Facebook integration
+    facebook_page_id: Optional[str] = None
+    facebook_page_access_token: Optional[str] = None
 
     def public_dump(self) -> dict:
         """Return a settings payload that is safe to expose to authenticated clients."""
@@ -86,6 +89,7 @@ _SECRET_FIELDS = {
     "shopee_partner_key",
     "lazada_app_secret",
     "lazada_access_token",
+    "facebook_page_access_token",
 }
 
 
