@@ -740,7 +740,10 @@ async def get_facebook_insights(
         async with httpx.AsyncClient(timeout=10.0) as client:
             meta_resp = await client.get(
                 post_url,
-                params={"fields": "message,created_time,shares,comments.summary(true),permalink_url,full_picture", "access_token": page_access_token}
+                params={
+                    "fields": "message,created_time,shares,comments.summary(true),permalink_url,full_picture,reactions.summary(true),reactions.type(LIKE).summary(true).limit(0) as like,reactions.type(LOVE).summary(true).limit(0) as love,reactions.type(HAHA).summary(true).limit(0) as haha,reactions.type(WOW).summary(true).limit(0) as wow,reactions.type(SAD).summary(true).limit(0) as sad,reactions.type(ANGRY).summary(true).limit(0) as angry",
+                    "access_token": page_access_token
+                }
             )
 
             if meta_resp.status_code != 200:
@@ -749,28 +752,28 @@ async def get_facebook_insights(
 
             meta_data = meta_resp.json()
 
-            metrics = "post_impressions,post_impressions_unique,post_engaged_users,post_reactions_by_type_total,post_clicks"
+            metrics = "post_impressions,post_impressions_unique,post_engaged_users"
             insights_resp = await client.get(
                 insights_url,
                 params={"metric": metrics, "access_token": page_access_token}
             )
 
-            insights_data = []
-            if insights_resp.status_code == 200:
-                insights_data = insights_resp.json().get("data", [])
-            else:
-                print(f"Warning: Failed to fetch post insights: {insights_resp.text}")
-
             parsed_insights = {}
-            for item in insights_data:
-                name = item.get("name")
-                values = item.get("values", [])
-                if values:
-                    val = values[0].get("value")
-                    parsed_insights[name] = val
+            if insights_resp.status_code == 200:
+                for item in insights_resp.json().get("data", []):
+                    values = item.get("values", [])
+                    if values:
+                        parsed_insights[item["name"]] = values[0].get("value", 0)
 
-            reactions = parsed_insights.get("post_reactions_by_type_total", {})
-            total_reactions = sum(reactions.values()) if isinstance(reactions, dict) else 0
+            total_reactions = meta_data.get("reactions", {}).get("summary", {}).get("total_count", 0)
+            reactions = {
+                "like": meta_data.get("like", {}).get("summary", {}).get("total_count", 0),
+                "love": meta_data.get("love", {}).get("summary", {}).get("total_count", 0),
+                "haha": meta_data.get("haha", {}).get("summary", {}).get("total_count", 0),
+                "wow": meta_data.get("wow", {}).get("summary", {}).get("total_count", 0),
+                "sorry": meta_data.get("sad", {}).get("summary", {}).get("total_count", 0),
+                "anger": meta_data.get("angry", {}).get("summary", {}).get("total_count", 0),
+            }
 
             return {
                 "post_id": post_id,
@@ -783,7 +786,7 @@ async def get_facebook_insights(
                 "impressions": parsed_insights.get("post_impressions", 0),
                 "reach": parsed_insights.get("post_impressions_unique", 0),
                 "engaged_users": parsed_insights.get("post_engaged_users", 0),
-                "clicks": parsed_insights.get("post_clicks", 0),
+                "clicks": 0,
                 "reactions": reactions,
                 "reactions_count": total_reactions
             }
