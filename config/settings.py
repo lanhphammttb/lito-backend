@@ -68,9 +68,13 @@ class Settings(BaseModel):
     lazada_app_key: Optional[str] = None
     lazada_app_secret: Optional[str] = None
     lazada_access_token: Optional[str] = None
-    # Facebook integration
+    # Facebook / Instagram integration
     facebook_page_id: Optional[str] = None
+    facebook_page_name: Optional[str] = None
     facebook_page_access_token: Optional[str] = None
+    facebook_app_id: Optional[str] = None
+    facebook_app_secret: Optional[str] = None
+    instagram_business_account_id: Optional[str] = None
 
     def public_dump(self) -> dict:
         """Return a settings payload that is safe to expose to authenticated clients."""
@@ -90,7 +94,10 @@ _SECRET_FIELDS = {
     "lazada_app_secret",
     "lazada_access_token",
     "facebook_page_access_token",
+    "facebook_app_secret",
 }
+
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 
 
 # Constants

@@ -88,6 +88,7 @@ def find_product(product_id: int):
             feasibility_score=row.feasibility_score or 0,
             finished_qty=getattr(row, "finished_qty", 0) or 0,
             facebook_post_id=getattr(row, "facebook_post_id", None),
+            instagram_post_id=getattr(row, "instagram_post_id", None),
             created_by=row.created_by,
             updated_by=row.updated_by,
             materials=mat_usages, created_at=row.created_at, updated_at=row.updated_at,

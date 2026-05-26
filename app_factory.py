@@ -46,6 +46,7 @@ from routers.system import router as system_router, websocket_endpoint
 from routers.tasks import router as tasks_router
 from routers.upload import router as upload_router
 from routers.ga4_router import router as ga4_router
+from routers.social import router as social_router
 
 
 APP_TITLE = "LITO Handmade Business OS"
@@ -103,6 +104,7 @@ def include_routers(app: FastAPI) -> None:
     app.include_router(audit_router, prefix="/audit", tags=["Audit"])
     app.include_router(marketplace_router, prefix="/marketplace", tags=["Marketplace"])
     app.include_router(notifications_router, prefix="/notifications", tags=["Notifications"])
+    app.include_router(social_router, tags=["Social"])
     app.include_router(system_router, prefix="/system", tags=["System"])
     app.add_api_websocket_route("/ws", websocket_endpoint)
 

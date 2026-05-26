@@ -51,6 +51,7 @@ def save_product_sql(product):
             row.cost_breakdown_json = json.dumps(product.cost_breakdown) if product.cost_breakdown else None
             row.finished_qty = getattr(product, "finished_qty", 0) or 0
             row.facebook_post_id = getattr(product, "facebook_post_id", None)
+            row.instagram_post_id = getattr(product, "instagram_post_id", None)
             row.updated_at = product.updated_at
         else:
             row = ProductTable(
@@ -74,6 +75,7 @@ def save_product_sql(product):
                 cost_breakdown_json=json.dumps(product.cost_breakdown) if product.cost_breakdown else None,
                 finished_qty=getattr(product, "finished_qty", 0) or 0,
                 facebook_post_id=getattr(product, "facebook_post_id", None),
+                instagram_post_id=getattr(product, "instagram_post_id", None),
                 created_by=product.created_by,
                 created_at=product.created_at,
                 updated_at=product.updated_at,
@@ -674,6 +676,87 @@ async def update_facebook_post_id(
     upsert_mongo("products", product.model_dump(mode="json") if hasattr(product, "model_dump") else product.__dict__)
     log_activity(user.id, "product", product_id, "link_facebook_post", {"facebook_post_id": post_id})
     return {"ok": True, "facebook_post_id": post_id}
+
+
+@router.put("/{product_id}/instagram-post-id")
+async def update_instagram_post_id(
+    product_id: int,
+    payload: dict,
+    user: User = Depends(get_current_user)
+):
+    """Update just the instagram_post_id for a product."""
+    require_admin(user)
+    product = find_product(product_id)
+    post_id = payload.get("instagram_post_id")
+    if post_id is not None:
+        post_id = post_id.strip() or None
+
+    product.instagram_post_id = post_id
+    product.updated_at = utcnow()
+    save_product_sql(product)
+    upsert_mongo("products", product.model_dump(mode="json") if hasattr(product, "model_dump") else product.__dict__)
+    log_activity(user.id, "product", product_id, "link_instagram_post", {"instagram_post_id": post_id})
+    return {"ok": True, "instagram_post_id": post_id}
+
+
+@router.get("/{product_id}/instagram-insights")
+async def get_instagram_insights(
+    product_id: int,
+    user: User = Depends(get_current_user)
+):
+    """Retrieve details and insights for the linked Instagram post."""
+    import httpx
+    product = find_product(product_id)
+    media_id = product.instagram_post_id
+    if not media_id:
+        raise HTTPException(status_code=400, detail="Sản phẩm chưa được liên kết với bài viết Instagram nào")
+
+    token = settings.facebook_page_access_token
+    if not token:
+        raise HTTPException(status_code=400, detail="Chưa kết nối Facebook/Instagram trong Cài đặt")
+
+    _FB_API = "https://graph.facebook.com/v25.0"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            meta_resp = await client.get(
+                f"{_FB_API}/{media_id}",
+                params={
+                    "fields": "id,caption,media_type,timestamp,like_count,comments_count,permalink,media_url,thumbnail_url",
+                    "access_token": token,
+                },
+            )
+            meta = meta_resp.json()
+            if "error" in meta:
+                raise HTTPException(status_code=400, detail=f"Lỗi Instagram API: {meta['error'].get('message')}")
+
+            insights_resp = await client.get(
+                f"{_FB_API}/{media_id}/insights",
+                params={"metric": "impressions,reach,saved,total_interactions", "access_token": token},
+            )
+            ins_data = insights_resp.json()
+            insights = {}
+            for item in ins_data.get("data", []):
+                val = item.get("values", [{}])[0].get("value", 0) if item.get("values") else item.get("value", 0)
+                insights[item["name"]] = val
+
+        return {
+            "media_id": media_id,
+            "caption": meta.get("caption", ""),
+            "media_type": meta.get("media_type", ""),
+            "timestamp": meta.get("timestamp"),
+            "permalink": meta.get("permalink"),
+            "media_url": meta.get("media_url") or meta.get("thumbnail_url"),
+            "like_count": meta.get("like_count", 0),
+            "comments_count": meta.get("comments_count", 0),
+            "impressions": insights.get("impressions", 0),
+            "reach": insights.get("reach", 0),
+            "saved": insights.get("saved", 0),
+            "total_interactions": insights.get("total_interactions", 0),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi kết nối: {str(e)}")
 
 
 @router.get("/{product_id}/facebook-insights")
