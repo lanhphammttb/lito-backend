@@ -717,8 +717,24 @@ async def get_facebook_insights(
         }
 
     import httpx
-    post_url = f"https://graph.facebook.com/v19.0/{post_id}"
-    insights_url = f"https://graph.facebook.com/v19.0/{post_id}/insights"
+    # Resolve pfbid-format IDs to numeric page_id_post_id
+    if post_id.startswith("pfbid"):
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resolve_resp = await client.get(
+                f"https://graph.facebook.com/v25.0/{post_id}",
+                params={"fields": "id", "access_token": page_access_token}
+            )
+            if resolve_resp.status_code == 200:
+                resolved = resolve_resp.json().get("id")
+                if resolved:
+                    post_id = resolved
+                    product.facebook_post_id = resolved
+                    save_product_sql(product)
+            else:
+                raise HTTPException(status_code=400, detail="Không thể giải mã link pfbid. Hãy dùng ID bài viết dạng số từ Graph API Explorer.")
+
+    post_url = f"https://graph.facebook.com/v25.0/{post_id}"
+    insights_url = f"https://graph.facebook.com/v25.0/{post_id}/insights"
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
