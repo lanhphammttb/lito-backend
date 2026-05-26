@@ -718,8 +718,8 @@ async def get_facebook_insights(
 
     import httpx
     # Resolve pfbid-format IDs via URL lookup
+    page_id = getattr(settings, "facebook_page_id", None) or ""
     if post_id.startswith("pfbid"):
-        page_id = getattr(settings, "facebook_page_id", None) or ""
         permalink = f"https://www.facebook.com/{page_id}/posts/{post_id}" if page_id else f"https://www.facebook.com/posts/{post_id}"
         async with httpx.AsyncClient(timeout=10.0) as client:
             resolve_resp = await client.get(
@@ -729,11 +729,17 @@ async def get_facebook_insights(
             resolved = resolve_resp.json().get("id") if resolve_resp.status_code == 200 else None
             if resolved:
                 post_id = resolved
-                product.facebook_post_id = resolved
+                if "_" not in post_id and page_id:
+                    post_id = f"{page_id}_{post_id}"
+                product.facebook_post_id = post_id
                 save_product_sql(product)
             else:
                 err = resolve_resp.json().get("error", {}).get("message", "") if resolve_resp.status_code != 200 else ""
                 raise HTTPException(status_code=400, detail=f"Không thể giải mã link pfbid{': ' + err if err else ''}. Thử dùng ID dạng số: vào Graph API Explorer → /{page_id}/posts?fields=id,message → copy id bài viết.")
+
+    # General prefix check for purely numeric or raw IDs that don't have page_id prefix
+    if "_" not in post_id and page_id:
+        post_id = f"{page_id}_{post_id}"
 
     post_url = f"https://graph.facebook.com/v25.0/{post_id}"
 
