@@ -717,28 +717,25 @@ async def get_facebook_insights(
         }
 
     import httpx
-    # Resolve pfbid-format IDs via URL lookup
+    import re
     page_id = getattr(settings, "facebook_page_id", None) or ""
-    if post_id.startswith("pfbid"):
-        permalink = f"https://www.facebook.com/{page_id}/posts/{post_id}" if page_id else f"https://www.facebook.com/posts/{post_id}"
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resolve_resp = await client.get(
-                "https://graph.facebook.com/v25.0/",
-                params={"id": permalink, "fields": "id", "access_token": page_access_token}
-            )
-            resolved = resolve_resp.json().get("id") if resolve_resp.status_code == 200 else None
-            if resolved:
-                post_id = resolved
-                if "_" not in post_id and page_id:
-                    post_id = f"{page_id}_{post_id}"
-                product.facebook_post_id = post_id
-                save_product_sql(product)
-            else:
-                err = resolve_resp.json().get("error", {}).get("message", "") if resolve_resp.status_code != 200 else ""
-                raise HTTPException(status_code=400, detail=f"Không thể giải mã link pfbid{': ' + err if err else ''}. Thử dùng ID dạng số: vào Graph API Explorer → /{page_id}/posts?fields=id,message → copy id bài viết.")
 
-    # General prefix check for purely numeric or raw IDs that don't have page_id prefix
-    if "_" not in post_id and page_id:
+    # Normalize: nếu post_id là URL đầy đủ, extract post ID từ path
+    if post_id.startswith("http"):
+        try:
+            from urllib.parse import urlparse
+            path_parts = [p for p in urlparse(post_id).path.split("/") if p]
+            posts_idx = path_parts.index("posts") if "posts" in path_parts else -1
+            post_id = path_parts[posts_idx + 1] if posts_idx != -1 else path_parts[-1]
+        except Exception:
+            raise HTTPException(status_code=400, detail="Không thể đọc link bài viết. Vui lòng dùng ID số dạng: 877324125473060_122129...")
+
+    # pfbid không resolve được qua API
+    if post_id.startswith("pfbid"):
+        raise HTTPException(status_code=400, detail="Link dạng pfbid không được Facebook API hỗ trợ. Dùng ID số từ Graph API Explorer: /{page_id}/posts?fields=id,message")
+
+    # Nếu chỉ là post_id số thuần (không có page_id_), tự ghép
+    if re.fullmatch(r"\d+", post_id) and page_id:
         post_id = f"{page_id}_{post_id}"
 
     post_url = f"https://graph.facebook.com/v25.0/{post_id}"
