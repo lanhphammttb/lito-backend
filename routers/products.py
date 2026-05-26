@@ -736,61 +736,43 @@ async def get_facebook_insights(
                 raise HTTPException(status_code=400, detail=f"Không thể giải mã link pfbid{': ' + err if err else ''}. Thử dùng ID dạng số: vào Graph API Explorer → /{page_id}/posts?fields=id,message → copy id bài viết.")
 
     post_url = f"https://graph.facebook.com/v25.0/{post_id}"
-    insights_url = f"https://graph.facebook.com/v25.0/{post_id}/insights"
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
+            # Request 1: basic post metadata
             meta_resp = await client.get(
                 post_url,
                 params={
-                    "fields": "message,created_time,shares,comments.summary(true),permalink_url,full_picture,like:reactions.type(LIKE).limit(0).summary(total_count),love:reactions.type(LOVE).limit(0).summary(total_count),haha:reactions.type(HAHA).limit(0).summary(total_count),wow:reactions.type(WOW).limit(0).summary(total_count),sad:reactions.type(SAD).limit(0).summary(total_count),angry:reactions.type(ANGRY).limit(0).summary(total_count)",
+                    "fields": "message,story,created_time,shares,comments.summary(true),permalink_url,full_picture",
                     "access_token": page_access_token
                 }
             )
-
             if meta_resp.status_code != 200:
                 err_detail = meta_resp.json().get("error", {}).get("message", "Lỗi Graph API")
                 raise HTTPException(status_code=meta_resp.status_code, detail=f"Lỗi Facebook API: {err_detail}")
-
             meta_data = meta_resp.json()
 
-            metrics = "post_impressions,post_impressions_unique,post_engaged_users"
-            insights_resp = await client.get(
-                insights_url,
-                params={"metric": metrics, "access_token": page_access_token}
+            # Request 2: reactions by type
+            reactions_resp = await client.get(
+                post_url,
+                params={
+                    "fields": "reactions.summary(true)",
+                    "access_token": page_access_token
+                }
             )
-
-            parsed_insights = {}
-            if insights_resp.status_code == 200:
-                for item in insights_resp.json().get("data", []):
-                    values = item.get("values", [])
-                    if values:
-                        parsed_insights[item["name"]] = values[0].get("value", 0)
-
-            reactions = {
-                "like":  meta_data.get("like",  {}).get("summary", {}).get("total_count", 0),
-                "love":  meta_data.get("love",  {}).get("summary", {}).get("total_count", 0),
-                "haha":  meta_data.get("haha",  {}).get("summary", {}).get("total_count", 0),
-                "wow":   meta_data.get("wow",   {}).get("summary", {}).get("total_count", 0),
-                "sorry": meta_data.get("sad",   {}).get("summary", {}).get("total_count", 0),
-                "anger": meta_data.get("angry", {}).get("summary", {}).get("total_count", 0),
-            }
-            total_reactions = sum(reactions.values())
+            reactions_data = reactions_resp.json() if reactions_resp.status_code == 200 else {}
+            total_reactions = reactions_data.get("reactions", {}).get("summary", {}).get("total_count", 0)
 
             return {
                 "post_id": post_id,
-                "message": meta_data.get("message", ""),
+                "message": meta_data.get("message") or meta_data.get("story", ""),
                 "created_time": meta_data.get("created_time"),
                 "permalink_url": meta_data.get("permalink_url"),
                 "full_picture": meta_data.get("full_picture"),
                 "shares_count": meta_data.get("shares", {}).get("count", 0),
                 "comments_count": meta_data.get("comments", {}).get("summary", {}).get("total_count", 0),
-                "impressions": parsed_insights.get("post_impressions", 0),
-                "reach": parsed_insights.get("post_impressions_unique", 0),
-                "engaged_users": parsed_insights.get("post_engaged_users", 0),
-                "clicks": 0,
-                "reactions": reactions,
-                "reactions_count": total_reactions
+                "reactions_count": total_reactions,
+                "reactions": {}
             }
     except httpx.RequestError as exc:
         raise HTTPException(status_code=500, detail=f"Không thể kết nối tới Facebook Graph API: {str(exc)}")
