@@ -729,11 +729,19 @@ async def get_instagram_insights(
             if "error" in meta:
                 raise HTTPException(status_code=400, detail=f"Lỗi Instagram API: {meta['error'].get('message')}")
 
+            # Valid metrics for IMAGE/CAROUSEL; VIDEO adds video_views
+            base_metrics = "impressions,reach,saved,total_interactions,likes,comments,shares,follows,profile_visits"
+            media_type = meta.get("media_type", "IMAGE")
+            if media_type == "VIDEO":
+                base_metrics += ",video_views"
+
             insights_resp = await client.get(
                 f"{_FB_API}/{media_id}/insights",
-                params={"metric": "impressions,reach,saved,total_interactions,follows,profile_visits,profile_activity,website_clicks,shares", "access_token": token},
+                params={"metric": base_metrics, "access_token": token},
             )
             ins_data = insights_resp.json()
+            if "error" in ins_data:
+                print(f"[IG insights error] {ins_data['error']}")
             insights = {}
             for item in ins_data.get("data", []):
                 val = item.get("values", [{}])[0].get("value", 0) if item.get("values") else item.get("value", 0)
@@ -742,7 +750,7 @@ async def get_instagram_insights(
         return {
             "media_id": media_id,
             "caption": meta.get("caption", ""),
-            "media_type": meta.get("media_type", ""),
+            "media_type": media_type,
             "timestamp": meta.get("timestamp"),
             "permalink": meta.get("permalink"),
             "media_url": meta.get("media_url") or meta.get("thumbnail_url"),
@@ -752,11 +760,12 @@ async def get_instagram_insights(
             "reach": insights.get("reach", 0),
             "saved": insights.get("saved", 0),
             "total_interactions": insights.get("total_interactions", 0),
+            "likes": insights.get("likes", 0),
+            "comments": insights.get("comments", 0),
             "shares": insights.get("shares", 0),
             "profile_visits": insights.get("profile_visits", 0),
-            "profile_activity": insights.get("profile_activity", 0),
-            "website_clicks": insights.get("website_clicks", 0),
             "follows": insights.get("follows", 0),
+            "video_views": insights.get("video_views", 0),
         }
     except HTTPException:
         raise
