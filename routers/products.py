@@ -729,9 +729,9 @@ async def get_instagram_insights(
             if "error" in meta:
                 raise HTTPException(status_code=400, detail=f"Lỗi Instagram API: {meta['error'].get('message')}")
 
-            # Valid metrics for IMAGE/CAROUSEL; VIDEO adds video_views
-            base_metrics = "impressions,reach,saved,total_interactions,likes,comments,shares,follows,profile_visits"
+            # Valid insights metrics (likes/comments come from metadata, not insights)
             media_type = meta.get("media_type", "IMAGE")
+            base_metrics = "impressions,reach,saved,total_interactions,shares,follows,profile_visits"
             if media_type == "VIDEO":
                 base_metrics += ",video_views"
 
@@ -760,8 +760,6 @@ async def get_instagram_insights(
             "reach": insights.get("reach", 0),
             "saved": insights.get("saved", 0),
             "total_interactions": insights.get("total_interactions", 0),
-            "likes": insights.get("likes", 0),
-            "comments": insights.get("comments", 0),
             "shares": insights.get("shares", 0),
             "profile_visits": insights.get("profile_visits", 0),
             "follows": insights.get("follows", 0),
