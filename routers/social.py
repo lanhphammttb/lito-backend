@@ -73,7 +73,7 @@ async def get_instagram_media_insights(media_id: str, user: User = Depends(get_c
         resp = await client.get(
             f"{_FB_API}/{media_id}/insights",
             params={
-                "metric": "impressions,reach,saved,total_interactions",
+                "metric": "impressions,reach,saved,total_interactions,follows,profile_visits,shares",
                 "access_token": token,
             },
         )

@@ -731,7 +731,7 @@ async def get_instagram_insights(
 
             insights_resp = await client.get(
                 f"{_FB_API}/{media_id}/insights",
-                params={"metric": "impressions,reach,saved,total_interactions", "access_token": token},
+                params={"metric": "impressions,reach,saved,total_interactions,follows,profile_visits,profile_activity,website_clicks,shares", "access_token": token},
             )
             ins_data = insights_resp.json()
             insights = {}
@@ -752,6 +752,11 @@ async def get_instagram_insights(
             "reach": insights.get("reach", 0),
             "saved": insights.get("saved", 0),
             "total_interactions": insights.get("total_interactions", 0),
+            "shares": insights.get("shares", 0),
+            "profile_visits": insights.get("profile_visits", 0),
+            "profile_activity": insights.get("profile_activity", 0),
+            "website_clicks": insights.get("website_clicks", 0),
+            "follows": insights.get("follows", 0),
         }
     except HTTPException:
         raise
