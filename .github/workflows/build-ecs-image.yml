@@ -1,0 +1,54 @@
+name: Build initial LITO ECS image
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: lito-ecs-bootstrap
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials with OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          set -euo pipefail
+
+          IMAGE_SHA="$ECR_REGISTRY/$ECR_REPOSITORY:bootstrap-${GITHUB_SHA::12}"
+          IMAGE_BOOTSTRAP="$ECR_REGISTRY/$ECR_REPOSITORY:bootstrap"
+
+          docker build \
+            --platform linux/amd64 \
+            -t "$IMAGE_SHA" \
+            -t "$IMAGE_BOOTSTRAP" \
+            .
+
+          docker push "$IMAGE_SHA"
+          docker push "$IMAGE_BOOTSTRAP"
+
+          echo "Pushed $IMAGE_SHA"
