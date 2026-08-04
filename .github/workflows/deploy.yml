@@ -1,9 +1,7 @@
 name: Deploy backend to AWS Singapore (Docker Compose)
 
 on:
-  push:
-    branches:
-      - main
+  workflow_dispatch:
 
 jobs:
   deploy:
