@@ -4,6 +4,7 @@ from fastapi.responses import RedirectResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlmodel import Session, select
 import httpx
+from urllib.parse import urlencode
 
 from config.database import engine
 from config.settings import settings as app_settings, FRONTEND_URL, FACEBOOK_REDIRECT_URI
@@ -20,6 +21,11 @@ from models.user import User, UserTable
 from utils.datetime import utcnow
 
 router = APIRouter()
+
+
+def _facebook_frontend_redirect(**params):
+    """The admin frontend uses HashRouter, including OAuth result parameters."""
+    return RedirectResponse(f"{FRONTEND_URL.rstrip('/')}/#/settings?{urlencode(params)}")
 
 
 def _do_login(email: str, password: str) -> TokenResponse:
@@ -144,7 +150,7 @@ async def facebook_oauth_start(request: Request):
     """Redirect user to Facebook OAuth consent screen."""
     app_id = getattr(app_settings, "facebook_app_id", None)
     if not app_id:
-        return RedirectResponse(f"{FRONTEND_URL}/settings?facebook_error=Chưa+cấu+hình+Facebook+App+ID")
+        return _facebook_frontend_redirect(facebook_error="Chưa có cấu hình Facebook App ID được lưu trên hệ thống")
     redirect_uri = FACEBOOK_REDIRECT_URI
     scope = "pages_show_list,pages_read_engagement,pages_read_user_content,instagram_basic,instagram_manage_insights"
     fb_url = (
@@ -161,12 +167,12 @@ async def facebook_oauth_start(request: Request):
 async def facebook_oauth_callback(request: Request, code: str = None, error: str = None):
     """Handle Facebook OAuth callback, save page token to settings."""
     if error or not code:
-        return RedirectResponse(f"{FRONTEND_URL}/settings?facebook_error={error or 'cancelled'}")
+        return _facebook_frontend_redirect(facebook_error=error or 'cancelled')
 
     app_id = getattr(app_settings, "facebook_app_id", None)
     app_secret = getattr(app_settings, "facebook_app_secret", None)
     if not app_id or not app_secret:
-        return RedirectResponse(f"{FRONTEND_URL}/settings?facebook_error=Missing+app+credentials")
+        return _facebook_frontend_redirect(facebook_error="Chưa có cấu hình Facebook App ID và App Secret")
 
     redirect_uri = FACEBOOK_REDIRECT_URI
 
@@ -181,7 +187,7 @@ async def facebook_oauth_callback(request: Request, code: str = None, error: str
         user_token = token_data.get("access_token")
         if not user_token:
             msg = token_data.get("error", {}).get("message", "Token exchange failed")
-            return RedirectResponse(f"{FRONTEND_URL}/settings?facebook_error={msg}")
+            return _facebook_frontend_redirect(facebook_error=msg)
 
         # Exchange for long-lived user token (valid ~60 days)
         ll_resp = await client.get(
@@ -198,7 +204,7 @@ async def facebook_oauth_callback(request: Request, code: str = None, error: str
         )
         pages = accounts_resp.json().get("data", [])
         if not pages:
-            return RedirectResponse(f"{FRONTEND_URL}/settings?facebook_error=No+pages+found")
+            return _facebook_frontend_redirect(facebook_error="Không tìm thấy Trang Facebook được cấp quyền")
 
         # Prefer page matching saved page_id; else take first
         saved_page_id = getattr(app_settings, "facebook_page_id", None)
@@ -216,12 +222,8 @@ async def facebook_oauth_callback(request: Request, code: str = None, error: str
         "facebook_page_id": page["id"],
         "facebook_page_name": page.get("name", ""),
         "facebook_page_access_token": page["access_token"],
+        "instagram_business_account_id": ig_id,
     }
-    if ig_id:
-        update_data["instagram_business_account_id"] = ig_id
-
-    for key, value in update_data.items():
-        setattr(app_settings, key, value)
 
     with Session(engine) as session:
         row = session.exec(select(SettingsTable).where(SettingsTable.id == 1)).first()
@@ -233,8 +235,11 @@ async def facebook_oauth_callback(request: Request, code: str = None, error: str
         session.add(row)
         session.commit()
 
+    for key, value in update_data.items():
+        setattr(app_settings, key, value)
+
     page_name = page.get("name", "")
-    return RedirectResponse(f"{FRONTEND_URL}/settings?facebook_connected=true&page_name={page_name}")
+    return _facebook_frontend_redirect(facebook_connected='true', page_name=page_name)
 
 
 @router.delete("/facebook")
@@ -244,8 +249,6 @@ async def facebook_disconnect(user=Depends(get_current_user)):
     require_admin(user)
     fields = ["facebook_page_id", "facebook_page_name", "facebook_page_access_token",
               "instagram_business_account_id"]
-    for f in fields:
-        setattr(app_settings, f, None)
     with Session(engine) as session:
         row = session.exec(select(SettingsTable).where(SettingsTable.id == 1)).first()
         if row:
@@ -254,4 +257,6 @@ async def facebook_disconnect(user=Depends(get_current_user)):
                     setattr(row, f, None)
             session.add(row)
             session.commit()
+    for f in fields:
+        setattr(app_settings, f, None)
     return {"ok": True}

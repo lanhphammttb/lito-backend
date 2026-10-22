@@ -13,6 +13,13 @@ from services.product import clear_product_cost_cache
 
 router = APIRouter()
 
+# A general settings save must not disconnect a previously authorized account.
+# Explicit disconnection belongs to DELETE /auth/facebook.
+_SOCIAL_FIELDS = {
+    "facebook_page_id", "facebook_page_name", "facebook_page_access_token",
+    "facebook_app_id", "facebook_app_secret", "instagram_business_account_id",
+}
+
 
 @router.get("")
 async def get_settings(user: User = Depends(get_current_user)):
@@ -29,6 +36,9 @@ async def update_settings(
 ):
     """Update application settings."""
     require_admin(user)
+
+    payload = {key: value for key, value in payload.items()
+               if key not in _SOCIAL_FIELDS or (isinstance(value, str) and value.strip())}
 
     # Update ALL fields in in-memory settings
     for key, value in payload.items():
@@ -113,6 +123,8 @@ async def set_setting(
     value = payload.get("value")
     if value is None:
         raise HTTPException(status_code=400, detail="Thiếu giá trị")
+    if key in _SOCIAL_FIELDS and (not isinstance(value, str) or not value.strip()):
+        raise HTTPException(status_code=400, detail="Dùng chức năng Ngắt kết nối để gỡ liên kết Facebook")
     
     # Update in-memory if applicable
     if hasattr(app_settings, key):

@@ -86,11 +86,19 @@ class Settings(BaseModel):
 
     def public_dump(self) -> dict:
         """Return a settings payload that is safe to expose to authenticated clients."""
-        return self.model_dump(exclude=_SECRET_FIELDS)
+        return {**self.model_dump(exclude=_SECRET_FIELDS), **self.connection_status()}
 
     def admin_dump(self) -> dict:
         """Return the full settings payload for admin users."""
-        return self.model_dump()
+        return {**self.model_dump(), **self.connection_status()}
+
+    def connection_status(self) -> dict:
+        """Expose connection state without requiring clients to read secrets."""
+        return {
+            "facebook_connected": bool(self.facebook_page_id and self.facebook_page_access_token),
+            "facebook_oauth_configured": bool(self.facebook_app_id and self.facebook_app_secret),
+            "instagram_connected": bool(self.facebook_page_id and self.facebook_page_access_token and self.instagram_business_account_id),
+        }
 
 
 # Global settings instance

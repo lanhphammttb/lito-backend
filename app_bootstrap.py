@@ -378,7 +378,7 @@ def load_settings_from_db():
                         val = decoded if isinstance(decoded, list) else []
                     except (ValueError, TypeError):
                         val = [email.strip() for email in val.split(",") if email.strip()]
-                if val is not None and hasattr(settings, field):
+                if hasattr(settings, field):
                     try:
                         setattr(settings, field, val)
                     except Exception:

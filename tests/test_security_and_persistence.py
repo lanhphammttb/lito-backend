@@ -3,6 +3,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from contextlib import contextmanager
+from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -100,6 +102,111 @@ class SecurityAndPersistenceTests(unittest.TestCase):
         self.assertNotIn("smtp_password", payload)
         self.assertNotIn("shopee_partner_key", payload)
         self.assertNotIn("lazada_app_secret", payload)
+
+    @contextmanager
+    def saved_social_settings(self):
+        from config.database import engine
+        from config.settings import settings
+        from models.settings_table import SettingsTable
+        from routers.settings import _SOCIAL_FIELDS
+        from sqlmodel import Session
+        from app_bootstrap import load_settings_from_db
+        previous_memory = {key: getattr(settings, key) for key in _SOCIAL_FIELDS}
+        with Session(engine) as session:
+            row = session.get(SettingsTable, 1)
+            previous_row = {key: getattr(row, key) for key in _SOCIAL_FIELDS} if row else None
+            row = row or SettingsTable(id=1)
+            for key in _SOCIAL_FIELDS:
+                setattr(row, key, f"test-{key}")
+            session.add(row)
+            session.commit()
+        load_settings_from_db()
+        try:
+            yield
+        finally:
+            with Session(engine) as session:
+                row = session.get(SettingsTable, 1)
+                if previous_row is None:
+                    session.delete(row)
+                else:
+                    for key, value in previous_row.items():
+                        setattr(row, key, value)
+                    session.add(row)
+                session.commit()
+            for key, value in previous_memory.items():
+                setattr(settings, key, value)
+
+    def test_general_settings_save_preserves_social_connection_after_reload(self):
+        from app_bootstrap import load_settings_from_db
+        from routers.settings import _SOCIAL_FIELDS
+        with self.saved_social_settings():
+            for blank in (None, "", "   "):
+                response = self.client.patch("/settings", headers=self.auth_headers,
+                    json={key: blank for key in _SOCIAL_FIELDS})
+                self.assertEqual(response.status_code, 200, response.text)
+                load_settings_from_db()
+                saved = self.client.get("/settings", headers=self.auth_headers).json()
+                self.assertTrue(saved["facebook_connected"])
+                for key in _SOCIAL_FIELDS:
+                    self.assertEqual(saved[key], f"test-{key}")
+            response = self.client.put("/settings/facebook_page_access_token",
+                headers=self.auth_headers, json={"value": " "})
+            self.assertEqual(response.status_code, 400)
+
+    def test_disconnect_clears_stale_worker_connection_after_reload(self):
+        from app_bootstrap import load_settings_from_db
+        from config.settings import settings
+        with self.saved_social_settings():
+            response = self.client.delete("/auth/facebook", headers=self.auth_headers)
+            self.assertEqual(response.status_code, 200, response.text)
+            # Simulate another warm worker still holding the previous token.
+            settings.facebook_page_access_token = "stale-token"
+            settings.facebook_page_id = "stale-page"
+            settings.instagram_business_account_id = "stale-instagram"
+            load_settings_from_db()
+            self.assertIsNone(settings.facebook_page_access_token)
+            self.assertIsNone(settings.facebook_page_id)
+            self.assertIsNone(settings.instagram_business_account_id)
+            self.assertFalse(settings.public_dump()["facebook_connected"])
+            self.assertTrue(settings.public_dump()["facebook_oauth_configured"])
+
+    def test_social_connection_status_does_not_expose_credentials(self):
+        from config.settings import settings
+        with self.saved_social_settings():
+            payload = settings.public_dump()
+            self.assertTrue(payload["facebook_connected"])
+            self.assertTrue(payload["facebook_oauth_configured"])
+            self.assertTrue(payload["instagram_connected"])
+            self.assertNotIn("facebook_page_access_token", payload)
+            self.assertNotIn("facebook_app_secret", payload)
+
+    def test_facebook_callback_persists_connection_and_returns_to_hash_route(self):
+        from urllib.parse import urlsplit, parse_qs
+        from app_bootstrap import load_settings_from_db
+        from config.settings import settings
+        from unittest.mock import Mock
+        with self.saved_social_settings():
+            page_name = "LITO & Len / Màu #1"
+            responses = [
+                {"access_token": "short-user-token"},
+                {"access_token": "long-user-token"},
+                {"data": [{"id": "new-page", "name": page_name, "access_token": "saved-page-token"}]},
+                {},
+            ]
+            graph = AsyncMock()
+            graph.get.side_effect = [Mock(json=Mock(return_value=data)) for data in responses]
+            with patch("routers.auth.httpx.AsyncClient") as client:
+                client.return_value.__aenter__.return_value = graph
+                response = self.client.get("/auth/facebook/callback?code=test-code", follow_redirects=False)
+            self.assertEqual(response.status_code, 307)
+            fragment = urlsplit(response.headers["location"]).fragment
+            path, query = fragment.split("?", 1)
+            self.assertEqual(path, "/settings")
+            self.assertEqual(parse_qs(query)["page_name"], [page_name])
+            load_settings_from_db()
+            self.assertEqual(settings.facebook_page_id, "new-page")
+            self.assertEqual(settings.facebook_page_access_token, "saved-page-token")
+            self.assertIsNone(settings.instagram_business_account_id)
 
     def test_ai_route_requires_auth(self):
         response = self.client.post("/ai/analyze", json={"prompt": "hello"})
