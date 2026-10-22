@@ -103,6 +103,21 @@ def _list_items(kind: str) -> list[dict]:
         return [_load_item(row) for row in rows]
 
 
+def _delete_item(item_id: int, kind: str, user: User):
+    from services.auth import require_admin
+    from services.activity import log_activity
+    from services.deletion import locked_row
+    require_admin(user)
+    with Session(engine) as session:
+        row = locked_row(session, StrategyItemTable, item_id, "Mục chiến lược")
+        if row.kind != kind:
+            raise HTTPException(404, "Mục chiến lược không tồn tại")
+        session.delete(row)
+        session.commit()
+    log_activity(user.id, "strategy", item_id, "delete", {"kind": kind})
+    return {"message": "Đã xóa mục chiến lược"}
+
+
 def _okr_progress(okr: dict) -> dict:
     key_results = okr.get("key_results") or []
     total_progress = 0
@@ -148,6 +163,11 @@ async def create_okr(payload: StrategyPayload, user: User = Depends(get_current_
     return _create_item(KIND_OKR, payload.model_dump(), user)
 
 
+@router.delete("/strategy/okrs/{item_id}")
+async def delete_okr(item_id: int, user: User = Depends(get_current_user)):
+    return _delete_item(item_id, KIND_OKR, user)
+
+
 @router.put("/strategy/okrs/{okr_id}")
 async def update_okr(okr_id: int, payload: dict, user: User = Depends(get_current_user)):
     return _update_item(okr_id, KIND_OKR, payload)
@@ -188,6 +208,11 @@ async def create_swot(payload: StrategyPayload, user: User = Depends(get_current
     return _create_item(KIND_SWOT, payload.model_dump(), user)
 
 
+@router.delete("/strategy/swot/{item_id}")
+async def delete_swot(item_id: int, user: User = Depends(get_current_user)):
+    return _delete_item(item_id, KIND_SWOT, user)
+
+
 @router.get("/strategy/market-insights")
 async def get_market_insights(
     type: Optional[str] = None,
@@ -214,3 +239,8 @@ async def get_market_insights(
 @router.post("/strategy/market-insights")
 async def create_market_insight(payload: StrategyPayload, user: User = Depends(get_current_user)):
     return _create_item(KIND_INSIGHT, payload.model_dump(), user)
+
+
+@router.delete("/strategy/market-insights/{item_id}")
+async def delete_market_insight(item_id: int, user: User = Depends(get_current_user)):
+    return _delete_item(item_id, KIND_INSIGHT, user)

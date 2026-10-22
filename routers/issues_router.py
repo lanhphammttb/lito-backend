@@ -1,7 +1,8 @@
 """Issues router."""
 from typing import List, Optional
 from datetime import datetime
-from fastapi import APIRouter, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Response
+from services.auth import get_current_user
 from sqlmodel import Session, delete as sql_delete
 from pydantic import BaseModel, ConfigDict
 from models.user import User
@@ -228,11 +229,19 @@ async def create_issue_from_template(payload: IssueFromTemplateRequest):
 
 
 @router.delete("/issues/{issue_id}")
-async def delete_issue(issue_id: int):
+async def delete_issue(issue_id: int, user: User = Depends(get_current_user)):
+    from services.auth import require_admin
+    from services.deletion import forget_legacy
+    from sqlalchemy import delete
+    from models.issue import IssueCommentTable
+    require_admin(user)
     with Session(engine) as session:
         row = session.get(IssueTable, issue_id)
         if not row:
             raise HTTPException(status_code=404, detail="Issue không tồn tại")
+        session.exec(delete(IssueCommentTable).where(IssueCommentTable.issue_id == issue_id))
         session.delete(row)
         session.commit()
+    forget_legacy("issues", issue_id)
+    forget_legacy("issue_comments", issue_id, "issue_id")
     return {"ok": True}

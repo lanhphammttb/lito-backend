@@ -218,15 +218,17 @@ async def delete_material(
     user: User = Depends(get_current_user)
 ):
     """Delete material."""
+    from services.auth import require_admin
+    from services.deletion import delete_material as delete_sql, forget_legacy
+    require_admin(user)
     material = find_material(material_id)
     before_data = material.__dict__.copy()
 
     # Delete from SQL
     with Session(engine) as session:
-        row = session.get(MaterialTable, material_id)
-        if row:
-            session.delete(row)
-            session.commit()
+        delete_sql(session, material_id)
+        session.commit()
+    forget_legacy("materials", material_id)
 
     delete_mongo("materials", "id", material_id)
     log_activity(user.id, "material", material_id, "delete", {"name": material.name})

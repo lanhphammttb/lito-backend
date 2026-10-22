@@ -1,6 +1,7 @@
 """Customer routes."""
 from typing import List, Optional
 from datetime import datetime, date as date_type
+import json
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlmodel import Session
 
@@ -9,7 +10,7 @@ from models.user import User
 from models.customer import Customer, CustomerTable
 from schemas.customer import CustomerCreate
 from services.auth import get_current_user
-from services.customer import find_customer, compute_customer_metrics
+from services.customer import find_customer, compute_customer_metrics, customer_segment, order_revenue
 from services.activity import log_activity, create_audit_log
 from services.order import compute_order_totals
 
@@ -37,8 +38,6 @@ async def list_customers(
     from sqlmodel import select, or_
     with Session(engine) as session:
         statement = select(CustomerTable)
-        if segment:
-            statement = statement.where(CustomerTable.segment == segment)
         if search:
             search_pattern = f"%{search}%"
             statement = statement.where(or_(
@@ -47,7 +46,10 @@ async def list_customers(
                 CustomerTable.email.like(search_pattern)
             ))
             
-        results = session.exec(statement.offset(skip).limit(limit)).all()
+        results = session.exec(statement).all()
+        if segment:
+            results = [row for row in results if customer_segment(row) == segment]
+        results = results[skip:skip + limit]
         return [find_customer(r.id) for r in results]
 
 
@@ -59,7 +61,7 @@ async def get_customer_segments(user: User = Depends(get_current_user)):
         all_customers = session.exec(select(CustomerTable)).all()
         segments = {}
         for c in all_customers:
-            seg = c.segment or "unknown"
+            seg = customer_segment(c)
             if seg not in segments:
                 segments[seg] = {"count": 0, "total_spent": 0}
             segments[seg]["count"] += 1
@@ -121,17 +123,17 @@ async def auto_tag_customers(user: User = Depends(get_current_user)):
             orders_for_customer = session.exec(select(OrderTable).where(OrderTable.customer_id == c.id)).all()
             if not orders_for_customer:
                 continue
-            total_spent = sum(getattr(o, "revenue", 0) or 0 for o in orders_for_customer)
+            total_spent = sum(order_revenue(o) for o in orders_for_customer if o.status != 'cancelled')
             if total_spent > 500000:
                 tags = []
-                if c.tags:
+                if c.tags_json:
                     try:
-                        tags = json.loads(c.tags) if c.tags.startswith('[') else [t.strip() for t in c.tags.split(',') if t.strip()]
+                        tags = json.loads(c.tags_json)
                     except:
                         tags = []
                 if 'VIP' not in tags:
                     tags.append('VIP')
-                    c.tags = json.dumps(tags)
+                    c.tags_json = json.dumps(tags)
                     session.add(c)
                     tagged += 1
         session.commit()
@@ -164,13 +166,13 @@ async def get_customers_summary(user: User = Depends(get_current_user)):
             continue
         if getattr(o, 'status', '') in ('cancelled',):
             continue
-        o_date = getattr(o, 'date', None)
+        o_date = o.order_date
         if o_date and not isinstance(o_date, date_type):
             try:
                 o_date = date_type.fromisoformat(str(o_date)[:10])
             except Exception:
                 o_date = None
-        revenue = float(getattr(o, 'revenue', 0) or 0)
+        revenue = order_revenue(o)
         if cid not in customer_orders:
             customer_orders[cid] = {"order_count": 0, "total_revenue": 0.0, "last_order_date": None}
         customer_orders[cid]["order_count"] += 1
@@ -237,10 +239,10 @@ async def create_customer(
         phone=payload.phone,
         email=payload.email,
         address=payload.address,
-        note=payload.note,
-        segment=payload.segment,
+        notes=payload.notes,
         source=payload.source,
         tags=payload.tags or [],
+        created_by=user.id,
         created_at=now,
     )
     
@@ -251,10 +253,10 @@ async def create_customer(
             phone=customer.phone,
             email=customer.email,
             address=customer.address,
-            note=customer.note,
-            segment=customer.segment,
+            notes=customer.notes,
             source=customer.source,
-            tags=str(customer.tags) if customer.tags else None,
+            tags_json=json.dumps(customer.tags),
+            created_by=user.id,
             created_at=customer.created_at,
         )
         session.add(row)
@@ -284,10 +286,9 @@ async def update_customer(
     customer.phone = payload.phone
     customer.email = payload.email
     customer.address = payload.address
-    customer.note = payload.note
-    customer.segment = payload.segment
+    customer.notes = payload.notes
     customer.source = payload.source
-    customer.tags = payload.tags or customer.tags
+    customer.tags = payload.tags
     
     # Update in SQL
     with Session(engine) as session:
@@ -297,10 +298,9 @@ async def update_customer(
             row.phone = customer.phone
             row.email = customer.email
             row.address = customer.address
-            row.note = customer.note
-            row.segment = customer.segment
+            row.notes = customer.notes
             row.source = customer.source
-            row.tags = str(customer.tags) if customer.tags else None
+            row.tags_json = json.dumps(customer.tags)
             session.add(row)
             session.commit()
     
@@ -317,15 +317,17 @@ async def delete_customer(
     user: User = Depends(get_current_user)
 ):
     """Delete customer."""
+    from services.auth import require_admin
+    from services.deletion import delete_customer as delete_sql, forget_legacy
+    require_admin(user)
     customer = find_customer(customer_id)
     before_data = customer.model_dump() if hasattr(customer, "model_dump") else customer.__dict__.copy()
     
     # Delete from SQL
     with Session(engine) as session:
-        row = session.get(CustomerTable, customer_id)
-        if row:
-            session.delete(row)
-            session.commit()
+        delete_sql(session, customer_id)
+        session.commit()
+    forget_legacy("customers", customer_id)
     
     delete_mongo("customers", "id", customer_id)
     log_activity(user.id, "customer", customer_id, "delete", {"name": customer.name})

@@ -528,6 +528,13 @@ async def create_order(
         id=new_id,
         customer_id=payload.customer_id,
         date=payload.date or date.today(),
+        payment_status=payload.payment_status,
+        maker_user_id=payload.maker_user_id,
+        source_content_id=payload.source_content_id,
+        shipping_carrier=payload.shipping_carrier,
+        tracking_number=payload.tracking_number,
+        estimated_delivery_date=payload.estimated_delivery_date,
+        created_by=user.id,
         status=payload.status,
         channel=payload.channel or "manual",
         shipping_fee=payload.shipping_fee or 0,
@@ -737,15 +744,11 @@ async def delete_order(
     order = find_order(order_id)
     before_data = order.__dict__.copy()
 
-    # Restock if needed
-    if order.status in RESERVE_STATUSES:
-        restock_for_order(order, user)
-
+    from services.deletion import delete_order as delete_sql, forget_legacy
     with Session(engine) as session:
-        row = session.get(OrderTable, order_id)
-        if row:
-            session.delete(row)
-            session.commit()
+        delete_sql(session, order_id)
+        session.commit()
+    forget_legacy("orders", order_id)
     delete_mongo("orders", "id", order_id)
     log_activity(user.id, "order", order_id, "delete", {})
     await create_audit_log(user, "DELETE", "orders", order_id, before_data, None, request)

@@ -280,10 +280,11 @@ async def update_variant(variant_id: int, payload: dict, user: User = Depends(ge
 @router.delete("/variants/{variant_id}")
 async def delete_variant(variant_id: int, user: User = Depends(get_current_user)):
     """Delete variant."""
-    product_variants[:] = [v for v in product_variants if v.id != variant_id]
+    from services.auth import require_admin
+    from services.deletion import delete_variant as delete_sql, forget_legacy
+    require_admin(user)
     with Session(engine) as session:
-        row = session.get(ProductVariantTable, variant_id)
-        if row:
-            session.delete(row)
-            session.commit()
+        delete_sql(session, variant_id)
+        session.commit()
+    forget_legacy("product_variants", variant_id)
     return {"success": True}

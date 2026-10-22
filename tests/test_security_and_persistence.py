@@ -54,6 +54,7 @@ class SecurityAndPersistenceTests(unittest.TestCase):
         cls.auth_headers = {
             "Authorization": f"Bearer {login_response.json()['access_token']}"
         }
+        cls.user_id = cls.client.get('/auth/me', headers=cls.auth_headers).json()['id']
 
     @classmethod
     def tearDownClass(cls):
@@ -579,6 +580,207 @@ class SecurityAndPersistenceTests(unittest.TestCase):
         load_settings_from_db()
         self.assertEqual(self.catalog_request("get", "/settings")["notification_emails"], emails)
         self.assertEqual(self.catalog_request("get", "/settings/notification_emails")["value"], emails)
+
+
+    def test_delete_product_cleans_owned_rows_and_disappears(self):
+        from sqlmodel import Session, select
+        from config.database import engine
+        from models import ProductImageTable, ProductVariantTable, PriceChangeTable, LifecycleEventTable
+        product = self.catalog_request("post", "/products", {"name": "Disposable product", "base_price": 100})
+        pid = product["id"]
+        self.catalog_request("post", "/product-images", {"product_id": pid, "url": "https://example.com/test.png"})
+        self.catalog_request("post", f"/products/{pid}/variants", {"name": "Disposable variant"})
+        self.catalog_request("put", f"/products/{pid}", {"name": product["name"], "base_price": 120, "lifecycle_status": "prototype"})
+        self.catalog_request("delete", f"/products/{pid}")
+        self.catalog_request("get", f"/products/{pid}", status=404)
+        self.catalog_request("delete", f"/products/{pid}", status=404)
+        with Session(engine) as session:
+            for model in (ProductImageTable, ProductVariantTable, PriceChangeTable, LifecycleEventTable):
+                self.assertEqual(session.exec(select(model).where(model.product_id == pid)).all(), [])
+
+    def test_delete_product_order_and_job_dependencies(self):
+        p = self.catalog_request("post", "/products", {"name": "Order dependency"})
+        order = self.catalog_request("post", "/orders", {"date": "2026-10-22", "order_lines": [{"product_id": p["id"], "quantity": 1, "unit_price": 100}]})
+        self.catalog_request("delete", f"/products/{p['id']}", status=409)
+        self.catalog_request("delete", f"/orders/{order['id']}")
+        job = self.catalog_request("post", "/production-jobs", {"product_id": p["id"]})
+        self.catalog_request("delete", f"/products/{p['id']}", status=409)
+        self.catalog_request("delete", f"/production-jobs/{job['id']}")
+        self.catalog_request("delete", f"/products/{p['id']}")
+
+    def test_delete_material_checks_alternatives_stock_and_supplier_links(self):
+        supplier = self.catalog_request("post", "/inventory/suppliers", {"name": "Disposable supplier"})
+        main = self.catalog_request("post", "/materials", {"code": "delete-main", "name": "Primary", "supplier_id": supplier["id"]})
+        alt = self.make_material("delete-alternative", 0)
+        product = self.catalog_request("post", "/products", {"name": "Alternative dependency", "materials": [
+            {"material_id": main["id"], "quantity": 10, "alternative_material_ids": [main["id"], alt["id"], alt["id"]]}
+        ]})
+        self.assertEqual(product["materials"][0]["alternative_material_ids"], [alt["id"]])
+        self.catalog_request("delete", f"/materials/{main['id']}", status=409)
+        self.catalog_request("delete", f"/materials/{alt['id']}", status=409)
+        self.catalog_request("delete", f"/inventory/suppliers/{supplier['id']}", status=409)
+        self.catalog_request("delete", f"/products/{product['id']}")
+        self.catalog_request("delete", f"/materials/{main['id']}")
+        self.catalog_request("delete", f"/materials/{alt['id']}")
+        self.catalog_request("delete", f"/inventory/suppliers/{supplier['id']}")
+        stock = self.make_material("delete-has-stock", 10)
+        self.catalog_request("delete", f"/materials/{stock['id']}", status=409)
+        self.assertEqual(self.catalog_request("get", f"/materials/{stock['id']}")["stock_quantity"], 10)
+
+    def test_delete_customer_only_without_orders(self):
+        customer = self.catalog_request("post", "/customers", {"name": "Disposable customer"})
+        product = self.catalog_request("post", "/products", {"name": "Customer reference"})
+        order = self.catalog_request("post", "/orders", {"date": "2026-10-22", "customer_id": customer["id"],
+            "order_lines": [{"product_id": product["id"], "quantity": 1, "unit_price": 100}]})
+        self.catalog_request("delete", f"/customers/{customer['id']}", status=409)
+        self.catalog_request("delete", f"/orders/{order['id']}")
+        self.catalog_request("delete", f"/customers/{customer['id']}")
+        self.catalog_request("get", f"/customers/{customer['id']}", status=404)
+
+    def test_delete_po_preserves_paid_history(self):
+        draft = self.catalog_request("post", "/inventory/purchase-orders", {"lines": []})
+        self.catalog_request("delete", f"/inventory/purchase-orders/{draft['id']}")
+        paid = self.catalog_request("post", "/inventory/purchase-orders", {"lines": []})
+        self.catalog_request("post", f"/inventory/purchase-orders/{paid['id']}/payment", {"amount": 50})
+        self.catalog_request("delete", f"/inventory/purchase-orders/{paid['id']}", status=409)
+        self.assertEqual(self.catalog_request("get", f"/inventory/purchase-orders/{paid['id']}")["paid_amount"], 50)
+
+    def test_delete_strategy_all_kinds_and_wrong_kind_rejected(self):
+        for kind, payload in [
+            ("okrs", {"title": "Disposable OKR", "quarter": "Q4-2026"}),
+            ("swot", {"type": "strength", "description": "Disposable SWOT"}),
+            ("market-insights", {"type": "trend", "title": "Disposable insight"}),
+        ]:
+            item = self.catalog_request("post", f"/strategy/{kind}", payload)
+            wrong_kind = "swot" if kind == "okrs" else "okrs"
+            self.catalog_request("delete", f"/strategy/{wrong_kind}/{item['id']}", status=404)
+            self.catalog_request("delete", f"/strategy/{kind}/{item['id']}")
+            self.catalog_request("delete", f"/strategy/{kind}/{item['id']}", status=404)
+
+    def test_delete_content_legacy_alias_removes_sql_and_checks_order_source(self):
+        plan = self.catalog_request("post", "/content/plans", {"title": "Disposable content"})
+        self.catalog_request("delete", f"/content-plans/{plan['id']}")
+        listing = self.catalog_request("get", "/content/plans")
+        self.assertNotIn(plan["id"], [p["id"] for p in listing])
+        plan = self.catalog_request("post", "/content/plans", {"title": "Content revenue"})
+        product = self.catalog_request("post", "/products", {"name": "Content attribution product"})
+        self.catalog_request("post", "/orders", {"date": "2026-10-22", "source_content_id": plan["id"],
+            "order_lines": [{"product_id": product["id"], "quantity": 1, "unit_price": 100}]})
+        self.catalog_request("delete", f"/content/plans/{plan['id']}", status=409)
+        self.catalog_request("delete", f"/content-plans/{plan['id']}", status=409)
+
+    def test_delete_job_after_cancel_does_not_change_stock_or_other_holds(self):
+        material = self.make_material("delete-job-yarn", 100)
+        product = self.catalog_request("post", "/products", {"name": "Job deletion", "materials": [{"material_id": material["id"], "quantity": 10}]})
+        jobs = [self.catalog_request("post", "/production-jobs", {"product_id": product["id"]}) for _ in range(2)]
+        for job in jobs:
+            self.catalog_request("patch", f"/production-jobs/{job['id']}/status", {"status": "reserved"})
+        self.catalog_request("delete", f"/production-jobs/{jobs[0]['id']}", status=409)
+        self.catalog_request("patch", f"/production-jobs/{jobs[0]['id']}/status", {"status": "cancelled"})
+        self.catalog_request("delete", f"/production-jobs/{jobs[0]['id']}")
+        current = self.catalog_request("get", f"/materials/{material['id']}")
+        self.assertEqual((current["stock_quantity"], current["reserved_qty"]), (100, 10))
+        self.catalog_request("patch", f"/production-jobs/{jobs[1]['id']}/status", {"status": "in_progress"})
+        self.catalog_request("delete", f"/production-jobs/{jobs[1]['id']}", status=409)
+        self.assertEqual(self.catalog_request("get", f"/materials/{material['id']}")["stock_quantity"], 90)
+
+    def test_delete_routes_require_admin_and_do_not_accept_anonymous_requests(self):
+        response = self.client.post("/auth/register", json={"email": "delete-viewer@example.com", "password": "ViewerPassword123"})
+        self.assertEqual(response.status_code, 200, response.text)
+        headers = {"Authorization": "Bearer " + response.json()["access_token"]}
+        for path in ["/products/999999", "/materials/999999", "/inventory/suppliers/999999", "/inventory/purchase-orders/999999",
+                     "/customers/999999", "/orders/999999", "/production-jobs/999999", "/strategy/okrs/999999",
+                     "/strategy/swot/999999", "/strategy/market-insights/999999", "/products/variants/999999",
+                     "/content/plans/999999", "/content-plans/999999", "/issues/999999"]:
+            self.assertEqual(self.client.delete(path).status_code, 401, path)
+            self.assertEqual(self.client.delete(path, headers=headers).status_code, 403, path)
+
+    def test_bom_alternatives_are_validated_per_row_and_saved_as_snapshot(self):
+        main, alt1, alt2, pink, pink_alt = [self.make_material(f"bom-row-{i}", 100) for i in range(5)]
+        product = self.catalog_request("post", "/products", {"name": "Per-row alternatives", "materials": [
+            {"material_id": main["id"], "quantity": 10, "alternative_material_ids": [alt1["id"], alt2["id"]]},
+            {"material_id": pink["id"], "quantity": 15, "alternative_material_ids": [pink_alt["id"]]},
+        ]})
+        job = self.catalog_request("post", "/production-jobs", {"product_id": product["id"], "quantity": 2})
+        self.assertEqual([row["bom_line_index"] for row in job["materials"]], [0, 1])
+        self.assertEqual(job["materials"][0]["alternative_material_ids"], [alt1["id"], alt2["id"]])
+        rows = [{"material_id": alt2["id"], "bom_line_index": 0, "bom_material_id": main["id"], "quantity": 10},
+                {"material_id": pink_alt["id"], "bom_line_index": 1, "bom_material_id": pink["id"], "quantity": 15}]
+        self.catalog_request("put", f"/production-jobs/{job['id']}", {"materials": [{**rows[0], "material_id": pink_alt["id"]}]}, status=422)
+        self.catalog_request("put", f"/products/{product['id']}", {"name": product["name"], "materials": []})
+        updated = self.catalog_request("put", f"/production-jobs/{job['id']}", {"materials": rows})
+        self.assertEqual([row["planned_quantity"] for row in updated["materials"]], [20, 30])
+        self.catalog_request("patch", f"/production-jobs/{job['id']}/status", {"status": "completed"})
+        for material, expected in [(main, 100), (alt1, 100), (alt2, 80), (pink, 100), (pink_alt, 70)]:
+            self.assertEqual(self.catalog_request("get", f"/materials/{material['id']}")["stock_quantity"], expected)
+
+    def test_shared_alternative_keeps_bom_rows_and_checks_combined_stock(self):
+        main1, main2, common = [self.make_material(f"bom-shared-{i}", 40) for i in range(3)]
+        product = self.catalog_request("post", "/products", {"name": "Shared alternative", "materials": [
+            {"material_id": main1["id"], "quantity": 10, "alternative_material_ids": [common["id"]]},
+            {"material_id": main2["id"], "quantity": 15, "alternative_material_ids": [common["id"]]},
+        ]})
+        rows = [{"bom_line_index": index, "material_id": common["id"], "quantity": amount} for index, amount in enumerate([10, 15])]
+        job = self.catalog_request("post", "/production-jobs", {"product_id": product["id"], "quantity": 2, "materials": rows})
+        self.assertEqual(len(job["materials"]), 2)
+        self.assertEqual([m["quantity_per_product"] for m in job["materials"]], [10, 15])
+        self.catalog_request("patch", f"/production-jobs/{job['id']}/status", {"status": "reserved"}, status=400)
+        self.assertEqual(self.catalog_request("get", f"/materials/{common['id']}")["reserved_qty"], 0)
+        self.catalog_request("put", f"/production-jobs/{job['id']}", {"quantity": 1})
+        self.catalog_request("patch", f"/production-jobs/{job['id']}/status", {"status": "reserved"})
+        self.assertEqual(self.catalog_request("get", f"/materials/{common['id']}")["reserved_qty"], 25)
+        self.catalog_request("patch", f"/production-jobs/{job['id']}/status", {"status": "in_progress"})
+        material = self.catalog_request("get", f"/materials/{common['id']}")
+        self.assertEqual((material["stock_quantity"], material["reserved_qty"]), (15, 0))
+
+    def test_variant_delete_checks_stock_and_order_history(self):
+        product = self.catalog_request("post", "/products", {"name": "Variant deletion"})
+        variant = self.catalog_request("post", "/products/variants", {"product_id": product["id"], "name": "Stocked variant", "stock_quantity": 3})
+        self.catalog_request("delete", f"/products/variants/{variant['id']}", status=409)
+        self.catalog_request("delete", f"/products/{product['id']}", status=409)
+        self.catalog_request("put", f"/products/variants/{variant['id']}", {"stock_quantity": 0})
+        order = self.catalog_request("post", "/orders", {"date": "2026-10-22", "order_lines": [
+            {"product_id": product["id"], "variant_id": variant["id"], "quantity": 1, "unit_price": 100}]})
+        self.catalog_request("delete", f"/products/variants/{variant['id']}", status=409)
+        self.catalog_request("delete", f"/orders/{order['id']}")
+        self.catalog_request("delete", f"/products/variants/{variant['id']}")
+        self.catalog_request("delete", f"/products/variants/{variant['id']}", status=404)
+
+    def test_customer_fields_and_paid_order_flags_round_trip(self):
+        customer = self.catalog_request("post", "/customers", {"name": "Customer fields", "notes": "Keep this note", "tags": ["VIP"]})
+        loaded = self.catalog_request("get", f"/customers/{customer['id']}")
+        self.assertEqual((loaded["notes"], loaded["tags"]), ("Keep this note", ["VIP"]))
+        self.catalog_request("put", f"/customers/{customer['id']}", {"name": "Customer fields", "notes": "Updated", "tags": []})
+        self.assertEqual(self.catalog_request("get", f"/customers/{customer['id']}")["tags"], [])
+        product = self.catalog_request("post", "/products", {"name": "Paid order guard"})
+        order = self.catalog_request("post", "/orders", {"date": "2026-10-22", "customer_id": customer["id"],
+            "payment_status": "paid", "maker_user_id": self.user_id,
+            "order_lines": [{"product_id": product["id"], "quantity": 1, "unit_price": 100}]})
+        self.assertEqual(order["payment_status"], "paid")
+        self.catalog_request("delete", f"/orders/{order['id']}", status=409)
+        self.catalog_request("get", "/customers/summary")
+
+    def test_issue_delete_removes_comments_and_category_in_use_is_kept(self):
+        from sqlmodel import Session, select
+        from config.database import engine
+        from models.issue import IssueTable, IssueCommentTable
+        category = self.catalog_request("post", "/categories", {"name": "Category deletion guard"})
+        product = self.catalog_request("post", "/products", {"name": "Issue deletion", "categories": [category["id"]]})
+        self.catalog_request("delete", f"/categories/{category['id']}", status=409)
+        with Session(engine) as session:
+            issue = IssueTable(product_id=product["id"], description="Disposable issue")
+            session.add(issue)
+            session.commit()
+            session.refresh(issue)
+            issue_id = issue.id
+            session.add(IssueCommentTable(issue_id=issue_id, user_id=self.user_id, content="Disposable comment"))
+            session.commit()
+        self.catalog_request("delete", f"/products/{product['id']}", status=409)
+        self.catalog_request("delete", f"/issues/{issue_id}")
+        with Session(engine) as session:
+            self.assertEqual(session.exec(select(IssueCommentTable).where(IssueCommentTable.issue_id == issue_id)).all(), [])
+        self.catalog_request("delete", f"/products/{product['id']}")
+        self.catalog_request("delete", f"/categories/{category['id']}")
 
 
 if __name__ == "__main__":

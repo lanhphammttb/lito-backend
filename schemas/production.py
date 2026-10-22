@@ -6,6 +6,8 @@ from models.product import MaterialUsage
 
 
 class JobMaterialSelection(MaterialUsage):
+    bom_line_index: Optional[int] = Field(default=None, ge=0)
+    bom_material_id: Optional[int] = None
     quantity: float = Field(gt=0, allow_inf_nan=False)
     wastage_percent: float = Field(default=0, ge=0, le=100, allow_inf_nan=False)
     product_wastage_percent: Optional[float] = Field(default=None, ge=0, le=100, allow_inf_nan=False)

@@ -115,6 +115,20 @@ async def list_production_jobs(
         return output
 
 
+@router.delete("/{job_id}")
+async def delete_production_job(job_id: int, user: User = Depends(get_current_user)):
+    from services.auth import require_admin
+    from services.deletion import delete_production_job as delete_sql, forget_legacy
+    from services.activity import log_activity
+    require_admin(user)
+    with Session(engine) as session:
+        delete_sql(session, job_id)
+        session.commit()
+    forget_legacy("production_jobs", job_id)
+    log_activity(user.id, "production_job", job_id, "delete", {})
+    return {"message": "Đã xóa job"}
+
+
 @router.post("")
 async def create_production_job(
     payload: ProductionJobCreate,
@@ -169,10 +183,25 @@ def _load_job(row):
     return ProductionJob(**{**row.model_dump(), "materials": json.loads(row.materials_json or "[]")})
 
 
-def _plan_materials(product, quantity, selected):
+def _plan_materials(product, quantity, selected, previous=None):
     usages = selected if selected is not None else product.materials
-    materials = {}
-    for source in usages:
+    materials = []
+    for index, source in enumerate(usages):
+        bom_index = getattr(source, "bom_line_index", None) if selected is not None else index
+        origin = None
+        if bom_index is not None:
+            # Existing jobs keep their own BOM snapshot when the product changes.
+            origin = next((m for m in previous or [] if m.bom_line_index == bom_index), None)
+            if origin is None:
+                if bom_index >= len(product.materials):
+                    raise HTTPException(422, "Dòng BOM không tồn tại; chọn lại sản phẩm để tải định mức.")
+                origin = product.materials[bom_index]
+            original_id = getattr(origin, "bom_material_id", None) or origin.material_id
+            supplied_id = getattr(source, "bom_material_id", None)
+            if supplied_id is not None and supplied_id != original_id:
+                raise HTTPException(409, "Dòng BOM đã thay đổi; tải lại định mức trước khi lưu job.")
+            if source.material_id not in {original_id, *origin.alternative_material_ids}:
+                raise HTTPException(422, "Nguyên liệu được chọn không thuộc danh sách thay thế của dòng BOM này.")
         mid = source.material_id
         mat = find_material(mid)
         product_wastage = getattr(source, "product_wastage_percent", None)
@@ -180,19 +209,18 @@ def _plan_materials(product, quantity, selected):
             product_wastage = product.wastage_percent
         per_product = effective_quantity(source.quantity, product_wastage, source.wastage_percent, mat.unit_type)
         needed = round(per_product * quantity, 4)
-        if mid in materials:
-            materials[mid].planned_quantity += needed
-            materials[mid].quantity_per_product = None
-            continue
-        materials[mid] = ProductionMaterial(
+        materials.append(ProductionMaterial(
             material_id=mid, planned_quantity=needed,
             quantity_per_product=source.quantity,
             wastage_percent=source.wastage_percent,
             product_wastage_percent=product_wastage,
             material_name=mat.name, unit=mat.unit, unit_type=mat.unit_type,
             unit_price=mat.unit_price,
-        )
-    return list(materials.values())
+            bom_line_index=bom_index,
+            bom_material_id=(getattr(origin, "bom_material_id", None) or origin.material_id) if origin else None,
+            alternative_material_ids=list(origin.alternative_material_ids) if origin else [],
+        ))
+    return materials
 
 
 @router.put("/{job_id}")
@@ -210,7 +238,7 @@ async def update_production_job(job_id: int, payload: ProductionJobUpdate, user:
                 raise HTTPException(409, "Chỉ sửa số lượng/nguyên liệu khi job còn ở kế hoạch")
             new_quantity = payload.quantity or job.quantity
             if payload.materials is not None:
-                job.materials = _plan_materials(find_product(job.product_id), new_quantity, payload.materials)
+                job.materials = _plan_materials(find_product(job.product_id), new_quantity, payload.materials, previous=job.materials)
             else:
                 for material in job.materials:
                     material.planned_quantity = round(material.planned_quantity * new_quantity / job.quantity, 4)

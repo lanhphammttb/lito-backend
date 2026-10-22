@@ -249,12 +249,11 @@ async def delete_supplier(
     """Delete supplier."""
     require_admin(user)
     supplier = find_supplier(supplier_id)
-
+    from services.deletion import delete_supplier as delete_sql, forget_legacy
     with Session(engine) as session:
-        row = session.get(SupplierTable, supplier_id)
-        if row:
-            session.delete(row)
-            session.commit()
+        delete_sql(session, supplier_id)
+        session.commit()
+    forget_legacy("suppliers", supplier_id)
 
     log_activity(user.id, "supplier", supplier_id, "delete", {})
     return {"message": "Đã xóa nhà cung cấp"}
@@ -575,17 +574,12 @@ async def delete_purchase_order(
     user: User = Depends(get_current_user)
 ):
     """Delete purchase order."""
-    from services.inventory import find_purchase_order
-    po = find_purchase_order(po_id)
-
-    if po.status == "received":
-        raise HTTPException(status_code=400, detail="Không thể xóa PO đã nhận hàng")
-
+    require_admin(user)
+    from services.deletion import delete_purchase_order as delete_sql, forget_legacy
     with Session(engine) as session:
-        row = session.get(PurchaseOrderTable, po_id)
-        if row:
-            session.delete(row)
-            session.commit()
+        delete_sql(session, po_id)
+        session.commit()
+    forget_legacy("purchase_orders", po_id)
 
     log_activity(user.id, "purchase_order", po_id, "delete", {})
     return {"message": "Đã xóa purchase order"}

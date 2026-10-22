@@ -550,13 +550,15 @@ async def delete_product(
     product = find_product(product_id)
     before_data = product.model_dump() if hasattr(product, "model_dump") else product.__dict__.copy()
 
-    clear_product_cost_cache(product_id)
-
+    from services.deletion import delete_product as delete_sql, forget_legacy
     with Session(engine) as session:
-        row = session.get(ProductTable, product_id)
-        if row:
-            session.delete(row)
-            session.commit()
+        delete_sql(session, product_id)
+        session.commit()
+    clear_product_cost_cache(product_id)
+    forget_legacy("products", product_id)
+    for collection in ("product_variants", "product_images", "product_reviews", "demand_signals"):
+        forget_legacy(collection, product_id, "product_id")
+    forget_legacy("product_bundles", product_id, "parent_product_id")
     delete_mongo("products", "id", product_id)
     log_activity(user.id, "product", product_id, "delete", {"name": product.name})
     await create_audit_log(user, "DELETE", "products", product_id, before_data, None, request)

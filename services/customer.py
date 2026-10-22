@@ -1,5 +1,6 @@
 """Customer services."""
 from datetime import date
+import json
 from fastapi import HTTPException
 from sqlmodel import Session
 
@@ -9,6 +10,18 @@ from services.order import compute_order_totals
 # In-memory data stores
 customers = []
 orders = []
+
+
+def order_revenue(order):
+    lines = json.loads(order.order_lines_json or "[]")
+    return sum(float(line.get("unit_price", 0)) * float(line.get("quantity", 0)) for line in lines) + (order.shipping_fee or 0) - (order.discount or 0)
+
+
+def customer_segment(customer):
+    tags = json.loads(customer.tags_json or "[]")
+    if "VIP" in tags:
+        return "VIP"
+    return "repeater" if customer.total_orders > 1 else "new"
 
 
 def set_data_stores(c, o):
@@ -30,19 +43,20 @@ def find_customer(customer_id: int):
         
         tags = []
         import json
-        if row.tags:
+        if row.tags_json:
             try:
                 # Handle both json string and comma-separated
-                tags = json.loads(row.tags) if row.tags.startswith('[') else [t.strip() for t in row.tags.split(',') if t.strip()]
+                tags = json.loads(row.tags_json)
             except:
                 tags = []
                 
         return Customer(
             id=row.id, name=row.name, phone=row.phone, email=row.email,
-            address=row.address, note=row.note, segment=row.segment,
+            address=row.address, notes=row.notes,
             source=row.source, tags=tags, total_orders=row.total_orders,
             total_spent=row.total_spent, last_order_date=row.last_order_date,
             first_order_date=row.first_order_date, created_at=row.created_at,
+            created_by=row.created_by,
         )
 
 
@@ -64,21 +78,23 @@ def compute_customer_metrics():
             cust.first_order_date = None
             
             for o in orders_list:
-                revenue = getattr(o, "revenue", 0) or 0
+                if o.status == "cancelled":
+                    continue
+                revenue = order_revenue(o)
                 
                 cust.total_orders += 1
                 cust.total_spent += revenue
                 
                 o_date = None
-                if o.date:
+                if o.order_date:
                     from datetime import datetime, date
-                    if isinstance(o.date, datetime):
-                        o_date = o.date.date()
-                    elif isinstance(o.date, date):
-                        o_date = o.date
-                    elif isinstance(o.date, str):
+                    if isinstance(o.order_date, datetime):
+                        o_date = o.order_date.date()
+                    elif isinstance(o.order_date, date):
+                        o_date = o.order_date
+                    elif isinstance(o.order_date, str):
                         try:
-                            o_date = date.fromisoformat(o.date[:10])
+                            o_date = date.fromisoformat(o.order_date[:10])
                         except Exception:
                             pass
                             

@@ -1,7 +1,7 @@
 """Product models."""
 from typing import Optional, List, Dict, Any
 from datetime import datetime
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sqlmodel import SQLModel, Field as SQLField
 import json
 from utils.datetime import utcnow
@@ -14,6 +14,13 @@ class MaterialUsage(BaseModel):
     wastage_percent: float = Field(default=0, ge=0, le=100, allow_inf_nan=False)
     usage_unit: Optional[str] = None
     alternative_material_ids: List[int] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def normalize_alternatives(self):
+        self.alternative_material_ids = list(dict.fromkeys(
+            mid for mid in self.alternative_material_ids if mid != self.material_id
+        ))
+        return self
 
 
 class Product(BaseModel):

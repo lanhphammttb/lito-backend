@@ -248,13 +248,13 @@ async def delete_content_plan(
     user: User = Depends(get_current_user)
 ):
     """Delete content plan."""
+    from services.auth import require_admin
+    from services.deletion import delete_content_plan as delete_sql, forget_legacy
+    require_admin(user)
     with Session(engine) as session:
-        row = session.get(ContentPlanTable, plan_id)
-        if not row:
-            raise HTTPException(status_code=404, detail="Content plan không tồn tại")
-            
-        session.delete(row)
+        delete_sql(session, plan_id)
         session.commit()
+    forget_legacy("content_plans", plan_id)
     log_activity(user.id, "content_plan", plan_id, "delete", {})
     
     return {"message": "Đã xóa content plan"}

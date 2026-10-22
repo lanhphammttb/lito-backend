@@ -140,6 +140,10 @@ async def delete_category(
     user: User = Depends(get_current_user)
 ):
     """Delete category from DB."""
+    from services.auth import require_admin
+    from services.deletion import _json_reference
+    from models.product import ProductTable
+    require_admin(user)
     with Session(engine) as session:
         row = session.get(CategoryTable, category_id)
         if not row:
@@ -148,6 +152,8 @@ async def delete_category(
         children = session.exec(select(CategoryTable).where(CategoryTable.parent_id == category_id)).all()
         if children:
             raise HTTPException(status_code=400, detail="Không thể xóa category có sub-categories")
+        if _json_reference(session, ProductTable, "categories_json", category_id):
+            raise HTTPException(409, "Danh mục đang được sản phẩm sử dụng. Bỏ liên kết danh mục trước khi xóa.")
             
         session.delete(row)
         session.commit()

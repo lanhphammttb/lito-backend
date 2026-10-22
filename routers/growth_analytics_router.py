@@ -2,7 +2,9 @@
 from typing import List, Optional
 from datetime import datetime, timedelta, date
 from collections import defaultdict
-from fastapi import APIRouter, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Response
+from models.user import User
+from services.auth import get_current_user
 from pydantic import BaseModel, ConfigDict
 
 
@@ -215,12 +217,9 @@ async def content_performance_analytics():
 
 
 @router.delete("/content-plans/{plan_id}")
-async def delete_content_plan(plan_id: int):
-    for plan in content_plans:
-        if plan.id == plan_id:
-            content_plans.remove(plan)
-            return {"ok": True}
-    raise HTTPException(status_code=404, detail="Content plan không tồn tại")
+async def delete_content_plan(plan_id: int, user: User = Depends(get_current_user)):
+    from routers.content import delete_content_plan as delete_persisted_plan
+    return await delete_persisted_plan(plan_id, user)
 
 
 # --- Business health ----------------------------------------------------------
