@@ -66,9 +66,274 @@ class SecurityAndPersistenceTests(unittest.TestCase):
         engine.dispose()
         cls.temp_dir.cleanup()
 
+    def test_internal_report_routes_require_auth(self):
+        for path in ['/goals', '/issues', '/content-plans', '/content-plans/analytics',
+                     '/business-health', '/growth/aarrr-metrics', '/customers/lifecycle-analysis',
+                     '/customers/cohort-analysis', '/analytics/signals', '/analytics/funnel', '/content/marketing-frameworks']:
+            self.assertEqual(self.client.get(path).status_code, 401, path)
+
+    def test_goals_calculate_real_orders_and_get_does_not_write(self):
+        from sqlmodel import Session
+        from config.database import engine
+        from models.goal import GoalTable
+        mat = self.make_material('goal-cost', 100)
+        self.catalog_request('put', f"/materials/{mat['id']}", {**mat, 'unit_price': 2})
+        product = self.catalog_request('post', '/products', {'name': 'Goal cost', 'materials': [{'material_id': mat['id'], 'quantity': 10}]})
+        self.catalog_request('post', '/orders', {'date': '2091-01-02', 'status': 'confirmed', 'discount': 10, 'shipping_fee': 20,
+            'order_lines': [{'product_id': product['id'], 'quantity': 2, 'unit_price': 100}]})
+        self.catalog_request('post', '/orders', {'date': '2091-01-03', 'status': 'cancelled',
+            'order_lines': [{'product_id': product['id'], 'quantity': 10, 'unit_price': 100}]})
+        goal = self.catalog_request('post', '/goals', {'title': 'Revenue goal', 'target_type': 'revenue', 'target_value': 100,
+            'start_date': '2091-01-01', 'end_date': '2091-01-31'})
+        self.assertEqual(goal['current_value'], 190)
+        self.assertEqual(goal['status'], 'achieved')
+        goals = self.catalog_request('get', '/goals')
+        self.assertEqual(next(row for row in goals if row['id'] == goal['id'])['current_value'], 190)
+        with Session(engine) as session:
+            stored = session.get(GoalTable, goal['id'])
+            self.assertEqual(stored.status, 'active')
+            self.assertIsNone(stored.achieved_at)
+        self.catalog_request('post', '/goals', {'title': 'Invalid period', 'start_date': '2091-02-01', 'end_date': '2091-01-01'}, status=422)
+
+    def test_backup_can_restore_into_empty_database_and_rejects_overwrite(self):
+        from sqlalchemy import create_engine, MetaData, select, func, text
+        from sqlmodel import SQLModel
+        from config.database import engine
+        from services.backup import restore_snapshot
+        response = self.client.post('/backup', headers=self.auth_headers)
+        self.assertEqual(response.status_code, 200, response.text[:200])
+        payload = response.json()
+        self.assertEqual(payload['format'], 'lito-database-backup')
+        self.assertIn('users', payload['tables'])
+        self.assertIn('materials', payload['tables'])
+        restore_schema = None
+        if engine.dialect.name == 'postgresql':
+            import uuid
+            restore_schema = 'lito_qa_' + uuid.uuid4().hex
+            with engine.begin() as connection:
+                connection.execute(text(f'CREATE SCHEMA "{restore_schema}"'))
+            target = create_engine(engine.url.update_query_dict({'options': '-csearch_path=' + restore_schema}))
+        else:
+            target = create_engine(f"sqlite:///{Path(self.temp_dir.name) / 'restore-check.db'}")
+        try:
+            SQLModel.metadata.create_all(target)
+            counts = restore_snapshot(target, payload)
+            metadata = MetaData()
+            metadata.reflect(bind=target)
+            with target.connect() as conn:
+                for name, expected in counts.items():
+                    self.assertEqual(conn.execute(select(func.count()).select_from(metadata.tables[name])).scalar_one(), expected, name)
+            with self.assertRaisesRegex(ValueError, 'trống'):
+                restore_snapshot(target, payload)
+            broken = {**payload, 'sha256': 'corrupt'}
+            with self.assertRaisesRegex(ValueError, 'toàn vẹn'):
+                restore_snapshot(target, broken)
+            if restore_schema:
+                users = metadata.tables['users']
+                with target.begin() as conn:
+                    next_user = conn.execute(users.insert().values(name='Restored sequence check', email='sequence@example.com',
+                        password_hash='not-a-real-credential', role='USER', is_owner=False,
+                        created_at=__import__('datetime').datetime.now())).inserted_primary_key[0]
+                self.assertGreater(next_user, max(row['id'] for row in payload['tables']['users']))
+        finally:
+            target.dispose()
+            if restore_schema:
+                with engine.begin() as connection:
+                    connection.execute(text(f'DROP SCHEMA "{restore_schema}" CASCADE'))
+        self.assertEqual(self.client.post('/backup').status_code, 401)
+        viewer = self.client.post('/auth/register', json={'email': 'backup-viewer@example.com', 'password': 'viewer-password'}).json()
+        self.assertEqual(self.client.post('/backup', headers={'Authorization': 'Bearer ' + viewer['access_token']}).status_code, 403)
+
+    def test_order_jobs_cannot_duplicate_existing_plan(self):
+        product = self.catalog_request('post', '/products', {'name': 'Duplicate planning guard'})
+        order = self.catalog_request('post', '/orders', {'date': '2026-10-23', 'status': 'confirmed',
+            'order_lines': [{'product_id': product['id'], 'quantity': 2, 'unit_price': 100}]})
+        job = self.catalog_request('post', '/production-jobs', {'order_id': order['id'], 'product_id': product['id'], 'quantity': 2})
+        self.catalog_request('post', '/production-jobs', {'order_id': order['id'], 'product_id': product['id'], 'quantity': 1}, status=409)
+        self.catalog_request('put', f"/production-jobs/{job['id']}", {'quantity': 3}, status=409)
+        requirements = self.catalog_request('get', f"/orders/{order['id']}/production-requirements")
+        self.assertEqual(requirements[0]['remaining_quantity'], 0)
+        self.catalog_request('patch', f"/production-jobs/{job['id']}/status", {'status': 'cancelled'})
+        requirements = self.catalog_request('get', f"/orders/{order['id']}/production-requirements")
+        self.assertEqual(requirements[0]['remaining_quantity'], 2)
+
+    def test_shipping_rejects_shortage_and_commits_stock_with_order(self):
+        first = self.catalog_request('post', '/products', {'name': 'Shipment available'})
+        second = self.catalog_request('post', '/products', {'name': 'Shipment missing'})
+        self.catalog_request('post', f"/products/{first['id']}/adjust-finished", {'quantity_change': 5})
+        order = self.catalog_request('post', '/orders', {'date': '2026-10-23', 'order_lines': [
+            {'product_id': first['id'], 'quantity': 2, 'unit_price': 100},
+            {'product_id': second['id'], 'quantity': 1, 'unit_price': 100}]})
+        self.catalog_request('patch', f"/orders/{order['id']}", {'status': 'shipped'}, status=409)
+        self.assertEqual(self.catalog_request('get', f"/products/{first['id']}")['finished_qty'], 5)
+        self.assertEqual(self.catalog_request('get', f"/orders/{order['id']}")['status'], 'pending')
+        self.catalog_request('post', f"/products/{second['id']}/adjust-finished", {'quantity_change': 1})
+        self.catalog_request('patch', f"/orders/{order['id']}", {'status': 'shipped'})
+        self.catalog_request('patch', f"/orders/{order['id']}", {'status': 'delivered'})
+        self.catalog_request('patch', f"/orders/{order['id']}", {'status': 'delivered'})
+        self.assertEqual(self.catalog_request('get', f"/products/{first['id']}")['finished_qty'], 3)
+        self.catalog_request('patch', f"/orders/{order['id']}", {'status': 'confirmed'}, status=409)
+        self.catalog_request('patch', f"/orders/{order['id']}", {'status': 'unknown'}, status=400)
+        self.catalog_request('patch', f"/orders/{order['id']}", {'shipping_fee': -1}, status=422)
+        self.catalog_request('post', f"/products/{first['id']}/adjust-finished", {'quantity_change': -4}, status=409)
+        self.catalog_request('post', f"/products/{first['id']}/adjust-finished", {'quantity_change': 1.5}, status=422)
+
+    def test_tracking_fields_and_status_survive_reload(self):
+        product = self.catalog_request('post', '/products', {'name': 'Tracking persistence'})
+        self.catalog_request('post', f"/products/{product['id']}/adjust-finished", {'quantity_change': 2})
+        order = self.catalog_request('post', '/orders', {'date': '2026-10-23',
+            'order_lines': [{'product_id': product['id'], 'quantity': 1, 'unit_price': 100}]})
+        self.catalog_request('post', f"/orders/{order['id']}/tracking", {'status': 'shipped',
+            'tracking_number': 'QA-TRACKING', 'shipping_carrier': 'QA', 'estimated_delivery_date': '2026-10-25'})
+        loaded = self.catalog_request('get', f"/orders/{order['id']}")
+        self.assertEqual(loaded['status'], 'shipped')
+        self.assertEqual(loaded['tracking_number'], 'QA-TRACKING')
+        self.assertEqual(loaded['shipping_carrier'], 'QA')
+        self.assertEqual(loaded['estimated_delivery_date'], '2026-10-25')
+        self.assertEqual(self.catalog_request('get', f"/products/{product['id']}")['finished_qty'], 1)
+
+    def test_saved_estimated_order_cost_does_not_drift_with_material_price(self):
+        material = self.make_material('stable-order-cost', 100)
+        product = self.catalog_request('post', '/products', {'name': 'Stable cost', 'materials': [
+            {'material_id': material['id'], 'quantity': 10}]})
+        order = self.catalog_request('post', '/orders', {'date': '2026-10-23',
+            'order_lines': [{'product_id': product['id'], 'quantity': 2, 'unit_price': 100}]})
+        initial = order['computed']['cost']
+        self.catalog_request('put', f"/materials/{material['id']}", {**material, 'unit_price': material['unit_price'] * 2})
+        loaded = self.catalog_request('get', f"/orders/{order['id']}")
+        self.assertEqual(loaded['computed']['cost'], initial)
+        self.assertEqual(loaded['computed']['cost_basis'], 'saved_estimate')
+        self.assertTrue(loaded['computed']['cost_is_estimated'])
+        listed = next(row for row in self.catalog_request('get', '/orders') if row['id'] == order['id'])
+        self.assertEqual(listed['computed']['cost'], initial)
+
+    def test_reports_use_persisted_content_orders_and_real_expenses(self):
+        from datetime import date
+        before = self.catalog_request('get', '/business-health')
+        product = self.catalog_request('post', '/products', {'name': 'Report source', 'time_minutes': 0,
+            'cost_breakdown': {'other': 3}})
+        order = self.catalog_request('post', '/orders', {'date': date.today().isoformat(),
+            'order_lines': [{'product_id': product['id'], 'quantity': 2, 'unit_price': 50}]})
+        self.assertEqual(order['computed']['cost'], 6)
+        self.catalog_request('post', '/expenses', {'date': date.today().isoformat(), 'category': 'other', 'amount': 7})
+        after = self.catalog_request('get', '/business-health')
+        self.assertEqual(after['summary']['total_orders'], before['summary']['total_orders'] + 1)
+        self.assertEqual(after['financial_metrics']['total_revenue'], before['financial_metrics']['total_revenue'] + 100)
+        self.assertEqual(after['financial_metrics']['monthly_burn'], before['financial_metrics']['monthly_burn'] + 7)
+        plan = self.catalog_request('post', '/content-plans', {'title': 'Published report source', 'status': 'published'})
+        self.catalog_request('post', f"/content-plans/{plan['id']}/performance", {'actual_views': 10, 'actual_revenue': 50})
+        metrics = self.catalog_request('get', '/content-plans/analytics')
+        self.assertGreaterEqual(metrics['summary']['total_revenue'], 50)
+        self.assertIsNone(metrics['summary']['avg_roi'])
+
+    def test_order_summary_reads_current_reference_data_without_startup_cache(self):
+        from routers import orders as orders_router
+        customer = self.catalog_request('post', '/customers', {'name': 'Current reference customer'})
+        product = self.catalog_request('post', '/products', {'name': 'Current reference product'})
+        content = self.catalog_request('post', '/content-plans', {'title': 'Current reference post'})
+        self.catalog_request('post', '/orders', {'date': '2026-10-23', 'customer_id': customer['id'],
+            'maker_user_id': self.user_id,
+            'order_lines': [{'product_id': product['id'], 'quantity': 1, 'unit_price': 100}]})
+        with patch.object(orders_router, '_products', []), patch.object(orders_router, '_customers', []), \
+             patch.object(orders_router, '_users', []), patch.object(orders_router, '_content_plans', []):
+            response = self.catalog_request('get', '/orders/summary')
+        self.assertIn(product['id'], [row['id'] for row in response['products']])
+        self.assertIn(customer['id'], [row['id'] for row in response['customers']])
+        self.assertIn(content['id'], [row['id'] for row in response['contents']])
+        self.assertIn(self.user_id, [row['id'] for row in response['users']])
+        self.assertTrue(all('password_hash' not in row for row in response['users']))
+
+    def test_cashflow_reads_paid_transactions_from_sql_and_filters_dates(self):
+        from datetime import date
+        from routers import cashflow_router
+        product = self.catalog_request('post', '/products', {'name': 'Cashflow product'})
+        order = self.catalog_request('post', '/orders', {'date': date.today().isoformat(),
+            'order_lines': [{'product_id': product['id'], 'quantity': 1, 'unit_price': 100}]})
+        pending = self.catalog_request('post', f"/orders/{order['id']}/payments", {'order_id': order['id'], 'amount': 30})
+        paid = self.catalog_request('post', f"/orders/{order['id']}/payments", {'order_id': order['id'], 'amount': 50, 'status': 'paid'})
+        with patch.object(cashflow_router, '_payments', []), patch.object(cashflow_router, '_expenses', []):
+            response = self.catalog_request('get', f'/cashflow/transactions?start_date={date.today().isoformat()}&end_date={date.today().isoformat()}')
+        self.assertIn(f"pay_{paid['id']}", [row['id'] for row in response])
+        self.assertNotIn(f"pay_{pending['id']}", [row['id'] for row in response])
+        from datetime import datetime
+        self.assertEqual(cashflow_router._parse_date(datetime(2026, 10, 22, 18)), date(2026, 10, 23))
+
+    def test_growth_compares_equal_periods_and_uses_percentage_change(self):
+        from datetime import date, timedelta
+        from routers import growth_analytics_router as analytics
+        product = self.catalog_request('post', '/products', {'name': 'Growth periods', 'time_minutes': 0})
+        order_ids = []
+        for age, price in [(100, 9000), (40, 100), (10, 150)]:
+            order = self.catalog_request('post', '/orders', {'date': (date.today() - timedelta(days=age)).isoformat(),
+                'order_lines': [{'product_id': product['id'], 'quantity': 1, 'unit_price': price}]})
+            order_ids.append(order['id'])
+        from services.order import find_order
+        with patch.object(analytics, '_persisted_orders', return_value=[find_order(oid) for oid in order_ids]):
+            response = self.catalog_request('get', '/growth/aarrr-metrics')
+        self.assertEqual(response['summary']['revenue_growth'], 50)
+        with patch.object(analytics, '_persisted_orders', return_value=[find_order(order_ids[-1])]):
+            response = self.catalog_request('get', '/growth/aarrr-metrics')
+        self.assertIsNone(response['summary']['revenue_growth'])
+
+    def test_cohorts_use_calendar_months(self):
+        from sqlmodel import Session
+        from config.database import engine
+        from models.customer import CustomerTable
+        from datetime import datetime
+        customer = self.catalog_request('post', '/customers', {'name': 'Calendar cohort'})
+        with Session(engine) as session:
+            row = session.get(CustomerTable, customer['id'])
+            row.created_at = datetime(2001, 1, 1)
+            session.add(row)
+            session.commit()
+        product = self.catalog_request('post', '/products', {'name': 'Calendar period', 'time_minutes': 0})
+        for month in (2, 3):
+            self.catalog_request('post', '/orders', {'date': f'2001-{month:02d}-01', 'customer_id': customer['id'],
+                'order_lines': [{'product_id': product['id'], 'quantity': 1, 'unit_price': 100}]})
+        response = self.catalog_request('get', '/customers/cohort-analysis')
+        cohort = next(row for row in response['cohorts'] if row['cohort'] == '2001-01')
+        self.assertEqual(cohort['revenue']['month_1'], 100)
+        self.assertEqual(cohort['revenue']['month_2'], 100)
+
+    def test_invalid_profit_margin_is_rejected_before_settings_save(self):
+        for value in (-0.1, 1, 2):
+            self.catalog_request('patch', '/settings', {'default_profit_margin': value}, status=422)
+
+    def test_variant_shipment_uses_matching_variant_stock(self):
+        product = self.catalog_request('post', '/products', {'name': 'Variant stock'})
+        pink = self.catalog_request('post', '/products/variants', {'product_id': product['id'], 'name': 'Pink', 'stock_quantity': 2})
+        blue = self.catalog_request('post', '/products/variants', {'product_id': product['id'], 'name': 'Blue', 'stock_quantity': 3})
+        order = self.catalog_request('post', '/orders', {'date': '2026-10-23',
+            'order_lines': [{'product_id': product['id'], 'variant_id': pink['id'], 'quantity': 1, 'unit_price': 100}]})
+        self.catalog_request('patch', f"/orders/{order['id']}", {'status': 'shipped'})
+        variants = self.catalog_request('get', '/products/variants')
+        self.assertEqual(next(row for row in variants if row['id'] == pink['id'])['stock_quantity'], 1)
+        self.assertEqual(next(row for row in variants if row['id'] == blue['id'])['stock_quantity'], 3)
+
+    def test_legacy_content_routes_persist_and_keep_authenticated_author(self):
+        from sqlmodel import Session
+        from config.database import engine
+        from models.content import ContentPlanTable
+        plan = self.catalog_request('post', '/content-plans', {'title': 'Persisted legacy content', 'platform': 'facebook'})
+        with Session(engine) as session:
+            self.assertEqual(session.get(ContentPlanTable, plan['id']).created_by, self.user_id)
+        self.catalog_request('put', f"/content-plans/{plan['id']}", {'title': 'Updated legacy content', 'caption': 'Keep this caption'})
+        self.catalog_request('post', f"/content-plans/{plan['id']}/performance", {'actual_views': 20, 'actual_revenue': 100})
+        loaded = next(row for row in self.catalog_request('get', '/content-plans') if row['id'] == plan['id'])
+        self.assertEqual(loaded['caption'], 'Keep this caption')
+        self.assertEqual(loaded['actual_views'], 20)
+
     def test_internal_products_requires_auth(self):
         response = self.client.get("/products")
         self.assertEqual(response.status_code, 401)
+
+    def test_all_local_read_routes_return_without_server_error(self):
+        for path, methods in self.backend_main.app.openapi()['paths'].items():
+            if 'get' not in methods or '{' in path or path.startswith(('/ga4', '/auth/facebook', '/facebook', '/instagram')):
+                continue
+            with self.subTest(path=path):
+                response = self.client.get(path, headers=self.auth_headers, follow_redirects=False)
+                self.assertEqual(response.status_code, 200, response.text[:180])
 
     def test_frontend_system_routes_and_database_health(self):
         for path in ("/alerts", "/users", "/issue-templates"):
@@ -186,6 +451,8 @@ class SecurityAndPersistenceTests(unittest.TestCase):
         from config.settings import settings
         from unittest.mock import Mock
         with self.saved_social_settings():
+            launch = self.catalog_request('post', '/auth/facebook/start', {})
+            ticket = parse_qs(urlsplit(launch['url']).query)['ticket'][0]
             page_name = "LITO & Len / Màu #1"
             responses = [
                 {"access_token": "short-user-token"},
@@ -197,7 +464,8 @@ class SecurityAndPersistenceTests(unittest.TestCase):
             graph.get.side_effect = [Mock(json=Mock(return_value=data)) for data in responses]
             with patch("routers.auth.httpx.AsyncClient") as client:
                 client.return_value.__aenter__.return_value = graph
-                response = self.client.get("/auth/facebook/callback?code=test-code", follow_redirects=False)
+                response = self.client.get('/auth/facebook/callback', params={'code': 'test-code', 'state': ticket},
+                    headers={'Cookie': 'facebook_oauth_state=' + ticket}, follow_redirects=False)
             self.assertEqual(response.status_code, 307)
             fragment = urlsplit(response.headers["location"]).fragment
             path, query = fragment.split("?", 1)
@@ -207,6 +475,32 @@ class SecurityAndPersistenceTests(unittest.TestCase):
             self.assertEqual(settings.facebook_page_id, "new-page")
             self.assertEqual(settings.facebook_page_access_token, "saved-page-token")
             self.assertIsNone(settings.instagram_business_account_id)
+
+    def test_facebook_oauth_requires_admin_and_browser_bound_state(self):
+        from urllib.parse import urlsplit, parse_qs
+        self.assertEqual(self.client.post('/auth/facebook/start').status_code, 401)
+        self.assertEqual(self.client.get('/auth/facebook', follow_redirects=False).status_code, 403)
+        with self.saved_social_settings():
+            launch = self.catalog_request('post', '/auth/facebook/start', {})
+            ticket = parse_qs(urlsplit(launch['url']).query)['ticket'][0]
+            start = self.client.get('/auth/facebook', params={'ticket': ticket}, follow_redirects=False)
+            self.assertEqual(start.status_code, 307)
+            self.assertEqual(parse_qs(urlsplit(start.headers['location']).query)['state'], [ticket])
+            cookie = start.headers['set-cookie'].lower()
+            self.assertIn('httponly', cookie)
+            self.assertIn('samesite=lax', cookie)
+            with patch('routers.auth.httpx.AsyncClient') as graph:
+                for params, headers in [({'code': 'unused'}, {}),
+                                        ({'code': 'unused', 'state': 'wrong'}, {'Cookie': 'facebook_oauth_state=' + ticket})]:
+                    response = self.client.get('/auth/facebook/callback', params=params, headers=headers, follow_redirects=False)
+                    self.assertIn('facebook_error=', response.headers['location'])
+                graph.assert_not_called()
+            # The OAuth ticket is scoped to consent and cannot authenticate API requests.
+            self.assertEqual(self.client.get('/auth/me', headers={'Authorization': 'Bearer ' + ticket}).status_code, 401)
+            registered = self.client.post('/auth/register', json={'email': 'oauth-viewer@example.com', 'password': 'viewer-password'})
+            self.assertEqual(registered.status_code, 200)
+            user_headers = {'Authorization': 'Bearer ' + registered.json()['access_token']}
+            self.assertEqual(self.client.post('/auth/facebook/start', headers=user_headers).status_code, 403)
 
     def test_ai_route_requires_auth(self):
         response = self.client.post("/ai/analyze", json={"prompt": "hello"})

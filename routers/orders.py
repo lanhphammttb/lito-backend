@@ -1,6 +1,7 @@
 """Order routes."""
 from typing import List, Optional
 from datetime import date
+from contextlib import nullcontext
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from sqlmodel import Session
 
@@ -17,24 +18,20 @@ from schemas.order import OrderCreate, OrderReturnCreate, PaymentCreate, Shippin
 from services.auth import get_current_user, require_admin
 from services.order import (
     compute_order_totals, validate_order_payload, apply_promo,
-    reserve_stock_for_order, restock_for_order, find_order
+    reserve_stock_for_order, restock_for_order, find_order,
+    order_lines_from_row, snapshot_order_costs,
 )
 from services.activity import log_activity, create_audit_log
 from services.notification import notify_new_order, notify_order_status_change
 from services.product import find_product
-from routers.products import save_product_sql
 from utils.datetime import utcnow
 from sqlmodel import select
 from models.order import OrderLineTable
 
 
-def save_order_sql(order):
+def save_order_sql(order, session=None):
     """Upsert an order to SQL."""
-    lines_json = json.dumps([
-        {"product_id": l.product_id, "quantity": l.quantity,
-         "unit_price": l.unit_price, "variant_id": l.variant_id}
-        for l in order.order_lines
-    ])
+    lines_json = json.dumps([line.model_dump() for line in order.order_lines])
     shipping_updates_json = json.dumps([
         {
             "order_id": getattr(u, "order_id", None),
@@ -51,7 +48,8 @@ def save_order_sql(order):
         }
         for u in getattr(order, "shipping_updates", [])
     ])
-    with Session(engine) as session:
+    owns_session = session is None
+    with (Session(engine) if owns_session else nullcontext(session)) as session:
         row = session.get(OrderTable, order.id)
         if row:
             row.order_date = order.date
@@ -112,7 +110,8 @@ def save_order_sql(order):
             )
             session.add(new_line)
 
-        session.commit()
+        if owns_session:
+            session.commit()
 
 
 def save_return_sql(return_obj: OrderReturn) -> OrderReturn:
@@ -239,55 +238,67 @@ router = APIRouter()
 RESERVE_STATUSES = {"confirmed", "processing", "producing"}
 
 
-SHIPPED_STATUSES = {"delivered", "completed"}
+SHIPPED_STATUSES = {"shipped", "delivered", "completed"}
 
-def _deduct_finished_qty(order):
-    """Trừ thành phẩm khi hàng rời kho. Bỏ qua nếu sản phẩm không tìm thấy."""
+
+def _change_finished_stock(session, order, direction):
+    from collections import defaultdict
+    from models.product import ProductTable, ProductVariantTable
+    quantities = defaultdict(int)
     for line in order.order_lines:
-        try:
-            product = find_product(line.product_id)
-            product.finished_qty = max(0, getattr(product, "finished_qty", 0) - line.quantity)
-            save_product_sql(product)
-        except Exception:
-            pass
+        quantities[(line.product_id, line.variant_id)] += line.quantity
+    changes = []
+    for (pid, vid), quantity in sorted(quantities.items(), key=lambda item: (item[0][0], item[0][1] or 0)):
+        model, identifier = (ProductVariantTable, vid) if vid is not None else (ProductTable, pid)
+        row = session.exec(select(model).where(model.id == identifier).with_for_update()).first()
+        if not row or (vid is not None and row.product_id != pid):
+            raise HTTPException(422, 'Sản phẩm hoặc biến thể không hợp lệ')
+        field = 'stock_quantity' if vid is not None else 'finished_qty'
+        available = getattr(row, field) or 0
+        if direction < 0 and available < quantity:
+            raise HTTPException(409, f'Không đủ thành phẩm cho sản phẩm #{pid}: cần {quantity}, hiện có {available}')
+        changes.append((row, field, available + direction * quantity))
+    for row, field, value in changes:
+        setattr(row, field, value)
+        session.add(row)
 
-def _restore_finished_qty(order):
-    """Hoàn lại thành phẩm khi đơn bị huỷ sau khi đã ship."""
-    for line in order.order_lines:
-        try:
-            product = find_product(line.product_id)
-            product.finished_qty = getattr(product, "finished_qty", 0) + line.quantity
-            save_product_sql(product)
-        except Exception:
-            pass
 
-def _apply_stock_transition(old_status: str, new_status: str, order, user):
-    """
-    Duy nhất một nơi quyết định thao tác kho khi đổi status đơn hàng.
-
-    NVL (nguyên vật liệu):
-    - confirmed / processing → RESERVE  (giữ chỗ NVL)
-    - cancelled              → RELEASE  (trả lại available)
-
-    Thành phẩm (finished_qty):
-    - → shipped/delivered/completed (lần đầu)  → DEDUCT
-    - cancelled từ trạng thái đã ship          → RESTORE
-    """
-    was_reserved = old_status in RESERVE_STATUSES
-    now_reserved  = new_status in RESERVE_STATUSES
-
-    if not was_reserved and now_reserved:
-        reserve_stock_for_order(order, user)
-    elif was_reserved and new_status == "cancelled":
-        restock_for_order(order, user)
-
-    # Thành phẩm: trừ khi lần đầu chuyển sang trạng thái đã giao hàng
+def _apply_stock_transition(old_status, new_status, order, user, session):
     was_shipped = old_status in SHIPPED_STATUSES
-    now_shipped  = new_status in SHIPPED_STATUSES
+    now_shipped = new_status in SHIPPED_STATUSES
+    if was_shipped and not now_shipped and new_status != 'cancelled':
+        raise HTTPException(409, 'Đơn đã xuất kho; không thể đưa về trạng thái trước giao hàng')
+    if old_status in RESERVE_STATUSES and new_status == 'cancelled':
+        restock_for_order(order, user)
     if not was_shipped and now_shipped:
-        _deduct_finished_qty(order)
-    elif was_shipped and new_status == "cancelled":
-        _restore_finished_qty(order)
+        _change_finished_stock(session, order, -1)
+    elif was_shipped and new_status == 'cancelled':
+        _change_finished_stock(session, order, 1)
+
+
+def _persist_order_transition(order, old_status, user):
+    from pydantic import ValidationError
+    try:
+        OrderCreate.model_validate(order.model_dump())
+    except ValidationError:
+        raise HTTPException(422, 'Thông tin đơn hàng không hợp lệ; kiểm tra số lượng, giá, phí và ngày giao hàng') from None
+    validate_order_payload(order)
+    with Session(engine) as session:
+        current = session.exec(select(OrderTable).where(OrderTable.id == order.id).with_for_update()).first()
+        if current and current.status != old_status:
+            raise HTTPException(409, 'Đơn hàng vừa thay đổi; tải lại trước khi lưu')
+        if current and old_status in SHIPPED_STATUSES:
+            def quantities(lines):
+                from collections import Counter
+                result = Counter()
+                for line in lines:
+                    result[(line.product_id, line.variant_id)] += line.quantity
+                return result
+            if quantities(order.order_lines) != quantities(order_lines_from_row(current)):
+                raise HTTPException(409, 'Không thể thay đổi hàng hóa của đơn đã xuất kho')
+        _apply_stock_transition(old_status, order.status, order, user, session)
+        save_order_sql(order, session=session)
+        session.commit()
 
 
 # In-memory data stores
@@ -332,14 +343,7 @@ async def list_orders(
         output = []
         for row in results:
             # Build relational lines if available, fallback to JSON
-            lines = []
-            if row.lines:
-                lines = [OrderLine(product_id=l.product_id, quantity=l.quantity, unit_price=l.unit_price, variant_id=l.variant_id) for l in row.lines]
-            elif row.order_lines_json:
-                try:
-                    lines = [OrderLine(**l) for l in json.loads(row.order_lines_json)]
-                except Exception:
-                    pass
+            lines = order_lines_from_row(row)
             
             order_obj = Order(
                 id=row.id,
@@ -406,14 +410,7 @@ async def get_orders_summary(user: User = Depends(get_current_user)):
             elif row.status in ("done", "delivered", "completed"):
                 completed_count += 1
 
-            lines = []
-            if getattr(row, "lines", None):
-                lines = [OrderLine(product_id=l.product_id, quantity=l.quantity, unit_price=l.unit_price, variant_id=l.variant_id) for l in row.lines]
-            elif row.order_lines_json:
-                try:
-                    lines = [OrderLine(**l) for l in json.loads(row.order_lines_json)]
-                except Exception:
-                    pass
+            lines = order_lines_from_row(row)
                     
             from models.order import ShippingUpdate
             shipping_updates = []
@@ -450,7 +447,7 @@ async def get_orders_summary(user: User = Depends(get_current_user)):
             totals = compute_order_totals(order_obj)
             orders_out.append({**order_obj.model_dump(), **totals, "computed": totals})
             
-            uid = getattr(order_obj, 'assigned_to', None) or getattr(order_obj, 'created_by', None)
+            uid = order_obj.maker_user_id or order_obj.created_by
             if uid:
                 user_revenue[uid] = user_revenue.get(uid, 0) + totals["revenue"]
                 user_profit[uid] = user_profit.get(uid, 0) + totals["profit"]
@@ -458,14 +455,24 @@ async def get_orders_summary(user: User = Depends(get_current_user)):
 
     total_revenue = sum(o["computed"]["revenue"] for o in orders_out)
 
-    products_out = [p.model_dump() if hasattr(p, 'model_dump') else dict(p) for p in _products]
-    customers_out = [c.model_dump() if hasattr(c, 'model_dump') else dict(c) for c in _customers]
-    users_out = [{"id": u.get("id"), "name": u.get("name"), "email": u.get("email"), "role": u.get("role")} for u in _users]
+    from models.product import ProductTable
+    from models.customer import CustomerTable
+    from models.user import UserTable
+    from models.content import ContentPlanTable
+    from services.customer import find_customer
+    with Session(engine) as session:
+        product_ids = session.exec(select(ProductTable.id)).all()
+        customer_ids = session.exec(select(CustomerTable.id)).all()
+        users_out = [{key: getattr(row, key) for key in ('id', 'name', 'email', 'role')}
+                     for row in session.exec(select(UserTable)).all()]
+        contents_out = [row.model_dump() for row in session.exec(select(ContentPlanTable)).all()]
+    products_out = [find_product(pid).model_dump() for pid in product_ids]
+    customers_out = [find_customer(cid).model_dump() for cid in customer_ids]
 
     maker_report = [
         {
             "maker_user_id": uid,
-            "maker_name": next((u.get("name") for u in _users if u.get("id") == uid), f"User #{uid}"),
+            "maker_name": next((u.get("name") for u in users_out if u.get("id") == uid), f"User #{uid}"),
             "orders_count": user_count[uid],
             "revenue": round(user_revenue[uid], 2),
             "profit": round(user_profit[uid], 2),
@@ -482,7 +489,7 @@ async def get_orders_summary(user: User = Depends(get_current_user)):
         "products": products_out,
         "customers": customers_out,
         "users": users_out,
-        "contents": [cp.model_dump() if hasattr(cp, 'model_dump') else dict(cp) for cp in _content_plans],
+        "contents": contents_out,
         "maker_report": maker_report,
     }
 
@@ -556,10 +563,11 @@ async def create_order(
         )
         order.order_lines.append(line)
 
+    snapshot_order_costs(order)
     if order.status in RESERVE_STATUSES:
         reserve_stock_for_order(order, user)
 
-    save_order_sql(order)
+    _persist_order_transition(order, 'pending', user)
     orders.append(order)
     upsert_mongo("orders", order.model_dump(mode="json") if hasattr(order, "model_dump") else order.__dict__)
     log_activity(user.id, "order", new_id, "create", {"status": order.status})
@@ -568,6 +576,13 @@ async def create_order(
 
     totals = compute_order_totals(order)
     return {**order.__dict__, "computed": totals}
+
+
+@router.get('/{order_id}/production-requirements')
+async def get_production_requirements(order_id: int, user: User = Depends(get_current_user)):
+    from services.fulfillment import production_requirements
+    with Session(engine) as session:
+        return production_requirements(session, order_id)
 
 
 @router.put("/{order_id}")
@@ -633,6 +648,7 @@ async def update_order(
     if "source_content_id" in data:
         order.source_content_id = data["source_content_id"]
     if "order_lines" in data:
+        previous_lines = order.order_lines
         order.order_lines = []
         for line_data in data["order_lines"] or []:
             line = OrderLine(
@@ -642,6 +658,7 @@ async def update_order(
                 variant_id=line_data.get("variant_id"),
             )
             order.order_lines.append(line)
+        snapshot_order_costs(order, previous_lines)
 
         # Keep legacy validation only when the client actually sends order lines
         validate_order_payload(type("_Payload", (), {
@@ -657,9 +674,7 @@ async def update_order(
 
     order.updated_at = utcnow()
 
-    _apply_stock_transition(old_status, order.status, order, user)
-
-    save_order_sql(order)
+    _persist_order_transition(order, old_status, user)
     upsert_mongo("orders", order.model_dump(mode="json") if hasattr(order, "model_dump") else order.__dict__)
     log_activity(user.id, "order", order_id, "update", {"status": order.status})
     await create_audit_log(user, "UPDATE", "orders", order_id, before_data, order.__dict__, request)
@@ -691,9 +706,7 @@ async def patch_order(
             setattr(order, key, val)
 
     new_status = order.status
-    _apply_stock_transition(old_status, new_status, order, user)
-
-    save_order_sql(order)
+    _persist_order_transition(order, old_status, user)
     upsert_mongo("orders", order.model_dump(mode="json") if hasattr(order, "model_dump") else order.__dict__)
     log_activity(user.id, "order", order_id, "patch", payload)
     await create_audit_log(user, "UPDATE", "orders", order_id, before_data, order.__dict__, request)
@@ -724,9 +737,7 @@ async def update_order_status(
     order.status = new_status
     order.updated_at = utcnow()
 
-    _apply_stock_transition(old_status, new_status, order, user)
-
-    save_order_sql(order)
+    _persist_order_transition(order, old_status, user)
     log_activity(user.id, "order", order_id, "status_change", {"from": old_status, "to": new_status})
     await create_audit_log(user, "UPDATE", "orders", order_id, before_data, order.__dict__, request)
     await notify_order_status_change(order_id, new_status, user.id)
@@ -829,12 +840,18 @@ async def add_shipping_update(
         estimated_delivery_date=payload.estimated_delivery_date,
         timestamp=utcnow(),
     )
-    shipping_updates.append(update)
-
     order = find_order(order_id)
+    old_status = order.status
+    for key in ('status', 'tracking_number', 'shipping_carrier', 'estimated_delivery_date'):
+        if key in payload.model_fields_set:
+            value = getattr(payload, key)
+            if key != 'status' or value:
+                setattr(order, key, value)
     order.shipping_updates = list(order.shipping_updates or [])
     order.shipping_updates.append(update)
-    save_order_sql(order)
+    order.updated_at = utcnow()
+    _persist_order_transition(order, old_status, user)
+    shipping_updates.append(update)
 
     return update
 

@@ -1,6 +1,6 @@
 """Cash flow aggregation router — combines income and outflows from all sources."""
 from typing import List, Optional
-from datetime import date, datetime
+from datetime import date, datetime, UTC, timezone, timedelta
 from fastapi import APIRouter, Depends
 
 from models.user import User
@@ -23,10 +23,12 @@ def set_data_stores(payments, expenses, purchase_orders=None):
 
 
 def _parse_date(v) -> Optional[date]:
+    if isinstance(v, datetime):
+        # SQL stores UTC timestamps; report days follow the shop's Vietnam timezone.
+        timestamp = v if v.tzinfo else v.replace(tzinfo=UTC)
+        return timestamp.astimezone(timezone(timedelta(hours=7))).date()
     if isinstance(v, date):
         return v
-    if isinstance(v, datetime):
-        return v.date()
     if isinstance(v, str):
         try:
             return date.fromisoformat(v[:10])
@@ -43,14 +45,21 @@ async def list_transactions(
 ):
     """Return all cash-flow transactions (income + outflow) within date range, newest first."""
     result = []
+    from sqlmodel import Session, select
+    from config.database import engine
+    from models.order import PaymentTable
+    from models.expense import ExpenseTable
+    with Session(engine) as session:
+        payments = session.exec(select(PaymentTable)).all()
+        expenses = session.exec(select(ExpenseTable)).all()
 
     # Income: customer payments
-    for p in _payments:
+    for p in payments:
         paid_date = _parse_date(getattr(p, "paid_date", None) or getattr(p, "created_at", None))
         if not paid_date:
             continue
         status = getattr(p, "status", "")
-        if status in ("cancelled", "refunded", "failed"):
+        if status not in ("paid", "completed"):
             continue
         if start_date and paid_date < start_date:
             continue
@@ -69,7 +78,7 @@ async def list_transactions(
         })
 
     # Outflow: operating expenses
-    for e in _expenses:
+    for e in expenses:
         exp_date = _parse_date(getattr(e, "date", None))
         if not exp_date:
             continue

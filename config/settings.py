@@ -97,6 +97,7 @@ class Settings(BaseModel):
         return {
             "facebook_connected": bool(self.facebook_page_id and self.facebook_page_access_token),
             "facebook_oauth_configured": bool(self.facebook_app_id and self.facebook_app_secret),
+            "facebook_redirect_uri": FACEBOOK_REDIRECT_URI,
             "instagram_connected": bool(self.facebook_page_id and self.facebook_page_access_token and self.instagram_business_account_id),
         }
 

@@ -12,6 +12,7 @@ class OrderLine(BaseModel):
     quantity: int = 1
     unit_price: float = 0
     variant_id: Optional[int] = None
+    unit_cost_snapshot: Optional[float] = Field(default=None, ge=0, allow_inf_nan=False)
 
 
 class ShippingUpdate(BaseModel):

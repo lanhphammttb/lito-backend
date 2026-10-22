@@ -30,6 +30,7 @@ def save_content_plan_sql(plan: ContentPlan) -> ContentPlan:
             row.format = plan.format
             row.status = plan.status
             row.scheduled_date = plan.scheduled_date
+            row.published_date = plan.published_date
             row.related_product_id = plan.related_product_id
             row.caption = plan.caption
             row.hashtags = plan.hashtags
@@ -50,6 +51,7 @@ def save_content_plan_sql(plan: ContentPlan) -> ContentPlan:
                 format=plan.format,
                 status=plan.status,
                 scheduled_date=plan.scheduled_date,
+                published_date=plan.published_date,
                 related_product_id=plan.related_product_id,
                 caption=plan.caption,
                 hashtags=plan.hashtags,
@@ -165,6 +167,7 @@ async def create_content_plan(
         format=payload.format,
         scheduled_date=payload.scheduled_date,
         status=payload.status or "draft",
+        published_date=date.today() if payload.status in {'published', 'Đã đăng'} else None,
         related_product_id=payload.related_product_id,
         caption=payload.caption,
         hashtags=payload.hashtags,
@@ -200,6 +203,8 @@ async def update_content_plan(
     plan.channel = payload.channel
     plan.format = payload.format
     plan.scheduled_date = payload.scheduled_date
+    if payload.status in {'published', 'Đã đăng'} and plan.status not in {'published', 'Đã đăng'}:
+        plan.published_date = date.today()
     plan.status = payload.status or plan.status
     plan.related_product_id = payload.related_product_id
     plan.caption = payload.caption

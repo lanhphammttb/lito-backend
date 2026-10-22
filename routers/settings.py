@@ -1,6 +1,7 @@
 """Settings routes."""
 from typing import Optional
 import json
+import math
 from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select
 
@@ -21,6 +22,16 @@ _SOCIAL_FIELDS = {
 }
 
 
+def _validate_margin(value):
+    try:
+        margin = float(value)
+        if not math.isfinite(margin) or not 0 <= margin < 1:
+            raise ValueError()
+    except (TypeError, ValueError):
+        raise HTTPException(422, 'Biên lợi nhuận phải từ 0% đến dưới 100%') from None
+    return margin
+
+
 @router.get("")
 async def get_settings(user: User = Depends(get_current_user)):
     """Get application settings."""
@@ -36,6 +47,9 @@ async def update_settings(
 ):
     """Update application settings."""
     require_admin(user)
+
+    if 'default_profit_margin' in payload:
+        payload['default_profit_margin'] = _validate_margin(payload['default_profit_margin'])
 
     payload = {key: value for key, value in payload.items()
                if key not in _SOCIAL_FIELDS or (isinstance(value, str) and value.strip())}
@@ -121,6 +135,8 @@ async def set_setting(
     require_admin(user)
     
     value = payload.get("value")
+    if key == 'default_profit_margin':
+        value = _validate_margin(value)
     if value is None:
         raise HTTPException(status_code=400, detail="Thiếu giá trị")
     if key in _SOCIAL_FIELDS and (not isinstance(value, str) or not value.strip()):

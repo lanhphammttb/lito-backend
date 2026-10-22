@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response
 from models.user import User
 from services.auth import get_current_user
 from pydantic import BaseModel, ConfigDict
+from schemas.content import ContentPlanCreate as PersistedPlanCreate, ContentPerformanceUpdate as PersistedPerformance
 
 
 class DummyModel(BaseModel):
@@ -17,7 +18,7 @@ class ContentPlanCreate(DummyModel): pass
 class ContentPerformanceUpdate(DummyModel): pass
 
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(get_current_user)])
 
 products: List = []
 orders: List = []
@@ -39,86 +40,94 @@ def set_data_stores(p, o, m, c, cp, ds):
 
 
 def compute_order_totals(order):
+    from services.order import compute_order_totals as calculate
+    from models.order import Order
     if isinstance(order, dict):
-        items = order.get("items", order.get("order_lines", []))
-        revenue = sum(item.get("unit_price", 0) * item.get("quantity", 0) for item in items)
-    else:
-        lines = getattr(order, "order_lines", getattr(order, "items", []))
-        revenue = sum(getattr(item, "unit_price", 0) * getattr(item, "quantity", 0) for item in (lines or []))
-    return {"revenue": revenue, "cost": 0, "profit": revenue}
+        order = Order.model_validate(order)
+    if order.status in {'cancelled', 'canceled', 'returned', 'void'}:
+        return {'revenue': 0, 'cost': 0, 'profit': 0}
+    return calculate(order)
 
 
-def compute_customer_metrics():
-    for cust in customers:
-        if not hasattr(cust, 'total_orders'):
-            cust.total_orders = 0
-            cust.total_spent = 0
-            cust.last_order_date = None
-            cust.first_order_date = None
+def compute_customer_metrics(current_customers=None, current_orders=None):
+    for cust in (customers if current_customers is None else current_customers):
+        relevant = [order for order in (orders if current_orders is None else current_orders)
+                    if order.customer_id == cust.id and order.status not in {'cancelled', 'returned'}]
+        cust.total_orders = len(relevant)
+        cust.total_spent = sum(compute_order_totals(order)['revenue'] for order in relevant)
+        dates = [order.date for order in relevant]
+        cust.last_order_date = max(dates, default=None)
+        cust.first_order_date = min(dates, default=None)
 
 
 def next_id(collection) -> int:
     return max((item.id for item in collection), default=0) + 1
 
 
+def _persisted_rows(model):
+    from sqlmodel import Session, select
+    from config.database import engine
+    with Session(engine) as session:
+        return session.exec(select(model)).all()
+
+
+def _persisted_orders():
+    from models.order import OrderTable
+    from services.order import find_order
+    return [find_order(row.id) for row in _persisted_rows(OrderTable) if row.status not in {'cancelled', 'returned', 'void'}]
+
+
+def _persisted_customers():
+    from models.customer import CustomerTable, Customer
+    import json
+    result = []
+    for row in _persisted_rows(CustomerTable):
+        try:
+            tags = json.loads(row.tags_json or '[]')
+        except (ValueError, TypeError):
+            tags = []
+        result.append(Customer(**{**row.model_dump(), 'tags': tags if isinstance(tags, list) else []}))
+    return result
+
+
 # --- Content plan endpoints ---------------------------------------------------
 
-@router.get("/content-plans")
-async def list_content_plans():
-    return content_plans
+@router.get("/content-plans", operation_id='legacy_list_content_plans')
+async def list_content_plans(user: User = Depends(get_current_user)):
+    from routers.content import list_content_plans as persisted
+    return await persisted(user=user)
 
 
-@router.post("/content-plans")
-async def create_content_plan(payload: ContentPlanCreate):
-    related_product_id = getattr(payload, 'related_product_id', None)
-    if related_product_id:
-        if not any(p.id == related_product_id for p in products):
-            raise HTTPException(status_code=404, detail="Product không tồn tại")
-    new_plan = ContentPlan(id=next_id(content_plans), **payload.model_dump(), created_by=1)
-    content_plans.append(new_plan)
-    return new_plan
+@router.post("/content-plans", operation_id='legacy_create_content_plan')
+async def create_content_plan(payload: PersistedPlanCreate, user: User = Depends(get_current_user)):
+    from routers.content import create_content_plan as persisted
+    return await persisted(payload, user)
 
 
-@router.put("/content-plans/{plan_id}")
-async def update_content_plan(plan_id: int, payload: ContentPlan):
-    if getattr(payload, 'id', plan_id) != plan_id:
-        raise HTTPException(status_code=400, detail="Không được đổi id")
-    related_product_id = getattr(payload, 'related_product_id', None)
-    if related_product_id:
-        if not any(p.id == related_product_id for p in products):
-            raise HTTPException(status_code=404, detail="Product không tồn tại")
-    for idx, plan in enumerate(content_plans):
-        if plan.id == plan_id:
-            payload.created_by = getattr(plan, 'created_by', None) or getattr(payload, 'created_by', None)
-            payload.updated_by = 1
-            content_plans[idx] = payload
-            return payload
-    raise HTTPException(status_code=404, detail="Content plan không tồn tại")
+@router.put("/content-plans/{plan_id}", operation_id='legacy_update_content_plan')
+async def update_content_plan(plan_id: int, payload: PersistedPlanCreate, user: User = Depends(get_current_user)):
+    from routers.content import update_content_plan as persisted
+    return await persisted(plan_id, payload, user)
 
 
 @router.post("/content-plans/{plan_id}/performance")
-async def update_content_performance(plan_id: int, payload: ContentPerformanceUpdate):
-    for idx, plan in enumerate(content_plans):
-        if plan.id == plan_id:
-            data = plan.model_dump()
-            for field, value in payload.model_dump(exclude_none=True).items():
-                data[field] = value
-            updated = ContentPlan(**data, updated_by=1)
-            content_plans[idx] = updated
-            return updated
-    raise HTTPException(status_code=404, detail="Content plan không tồn tại")
+async def update_content_performance(plan_id: int, payload: PersistedPerformance, user: User = Depends(get_current_user)):
+    from routers.content import update_content_performance as persisted
+    return await persisted(plan_id, payload, user)
 
 
 @router.get("/content-plans/analytics")
 async def content_performance_analytics():
+    from models.content import ContentPlanTable
+    content_plans = _persisted_rows(ContentPlanTable)
     analytics = []
 
     for content in content_plans:
         if content.status not in ("published", "Đã đăng") or not content.actual_revenue:
             continue
 
-        cost_to_create = 0
-        roi = 0
+        cost_to_create = None
+        roi = None
 
         views = content.actual_views or 0
         inquiries = content.actual_inquiries or 0
@@ -140,7 +149,7 @@ async def content_performance_analytics():
             "orders": content_orders,
             "revenue": content.actual_revenue,
             "cost": cost_to_create,
-            "roi": round(roi, 2),
+            "roi": roi,
             "view_to_inquiry_rate": round(view_to_inquiry, 2),
             "inquiry_to_order_rate": round(inquiry_to_order, 2),
             "view_to_order_rate": round(view_to_order, 2),
@@ -155,7 +164,7 @@ async def content_performance_analytics():
         format_stats[fmt]["count"] += 1
         format_stats[fmt]["total_revenue"] += a["revenue"]
         format_stats[fmt]["total_views"] += a["views"]
-        format_stats[fmt]["total_roi"] += a["roi"]
+        format_stats[fmt]["total_roi"] += a["roi"] or 0
 
     best_formats = [
         {
@@ -163,11 +172,11 @@ async def content_performance_analytics():
             "count": stats["count"],
             "avg_revenue": round(stats["total_revenue"] / stats["count"], 2),
             "avg_views": round(stats["total_views"] / stats["count"], 2),
-            "avg_roi": round(stats["total_roi"] / stats["count"], 2)
+            "avg_roi": None
         }
         for fmt, stats in format_stats.items()
     ]
-    best_formats.sort(key=lambda x: x["avg_roi"], reverse=True)
+    best_formats.sort(key=lambda x: x["avg_revenue"], reverse=True)
 
     day_stats = {}
     for a in analytics:
@@ -209,14 +218,14 @@ async def content_performance_analytics():
         "summary": {
             "total_contents": len(analytics),
             "total_revenue": round(sum(a["revenue"] for a in analytics), 2),
-            "total_cost": round(sum(a["cost"] for a in analytics), 2),
-            "avg_roi": round(sum(a["roi"] for a in analytics) / len(analytics), 2) if analytics else 0,
+            "total_cost": None,
+            "avg_roi": None,
             "avg_conversion": round(sum(a["view_to_order_rate"] for a in analytics) / len(analytics), 2) if analytics else 0
         }
     }
 
 
-@router.delete("/content-plans/{plan_id}")
+@router.delete("/content-plans/{plan_id}", operation_id='legacy_delete_content_plan')
 async def delete_content_plan(plan_id: int, user: User = Depends(get_current_user)):
     from routers.content import delete_content_plan as delete_persisted_plan
     return await delete_persisted_plan(plan_id, user)
@@ -226,6 +235,9 @@ async def delete_content_plan(plan_id: int, user: User = Depends(get_current_use
 
 @router.get("/business-health")
 async def get_business_health():
+    from models.expense import ExpenseTable
+    orders = _persisted_orders()
+    customers = _persisted_customers()
     total_customers = len(customers)
     total_orders_count = len(orders)
     total_revenue = sum(compute_order_totals(o)["revenue"] for o in orders)
@@ -243,9 +255,10 @@ async def get_business_health():
 
     mar = recent_revenue / recent_customers if recent_customers > 0 else 0
 
-    total_content = len(content_plans)
-    estimated_content_cost = total_content * 50000
-    cac = estimated_content_cost / total_customers if total_customers > 0 else 0
+    recent_expenses = [row for row in _persisted_rows(ExpenseTable) if row.date >= thirty_days_ago.date()]
+    marketing_cost = sum(row.amount for row in recent_expenses if row.category == 'marketing')
+    new_customers = [customer for customer in customers if customer.created_at.date() >= thirty_days_ago.date()]
+    cac = marketing_cost / len(new_customers) if new_customers else 0
 
     avg_order_value = total_revenue / total_orders_count if total_orders_count > 0 else 0
 
@@ -256,25 +269,16 @@ async def get_business_health():
     repeat_customers = sum(1 for count in customer_order_counts.values() if count > 1)
     repeat_rate = repeat_customers / total_customers if total_customers > 0 else 0
 
-    avg_purchases_per_customer = total_orders_count / total_customers if total_customers > 0 else 1
-    ltv = avg_order_value * avg_purchases_per_customer * 2
+    avg_purchases_per_customer = total_orders_count / total_customers if total_customers > 0 else 0
+    ltv = avg_order_value * avg_purchases_per_customer
 
     ltv_cac_ratio = ltv / cac if cac > 0 else 0
 
     monthly_revenue_per_customer = mar
     payback_period = cac / monthly_revenue_per_customer if monthly_revenue_per_customer > 0 else 0
 
-    monthly_material_cost = sum(m.stock_quantity * m.unit_price for m in materials) / 12
-    monthly_fixed_costs = 5000000
-    monthly_burn = monthly_material_cost + monthly_fixed_costs + estimated_content_cost / 12
-
-    total_material_cost = sum(
-        sum(
-            usage.quantity * next((m.unit_price for m in materials if m.id == usage.material_id), 0)
-            for usage in p.materials
-        )
-        for p in products
-    )
+    monthly_burn = sum(row.amount for row in recent_expenses)
+    total_material_cost = sum(compute_order_totals(order)['cost'] for order in orders)
     gross_margin = (total_revenue - total_material_cost) / total_revenue if total_revenue > 0 else 0
 
     health_components = {
@@ -328,6 +332,10 @@ async def get_business_health():
 
 @router.get("/growth/aarrr-metrics")
 async def get_aarrr_metrics():
+    from models.content import ContentPlanTable
+    orders = _persisted_orders()
+    customers = _persisted_customers()
+    content_plans = _persisted_rows(ContentPlanTable)
     now = datetime.utcnow()
     thirty_days_ago = now - timedelta(days=30)
     ninety_days_ago = now - timedelta(days=90)
@@ -424,40 +432,44 @@ async def get_aarrr_metrics():
     if activation_rate < 0.3:
         insights.append({
             "type": "warning",
-            "metric": "Activation",
-            "message": f"Activation rate is low ({activation_rate*100:.1f}%). Focus on first-time buyer experience.",
-            "action": "Create welcome discount or first-purchase bundle"
+            "metric": "Mua lần đầu",
+            "message": f"Tỷ lệ mua lần đầu trong dữ liệu hiện tại: {activation_rate*100:.1f}%.",
+            "action": "Đối chiếu số khách hàng và thời gian quan sát trước khi điều chỉnh ưu đãi"
         })
 
     if retention_rate < 0.2:
         insights.append({
             "type": "warning",
-            "metric": "Retention",
-            "message": f"Retention rate is {retention_rate*100:.1f}%. Customers not coming back.",
-            "action": "Implement loyalty program or email remarketing"
+            "metric": "Khách quay lại",
+            "message": f"Tỷ lệ khách quay lại trong dữ liệu hiện tại: {retention_rate*100:.1f}%.",
+            "action": "Theo dõi thêm chu kỳ mua và phản hồi của khách hàng"
         })
 
     if referral_rate < 0.1:
         insights.append({
             "type": "opportunity",
-            "metric": "Referral",
-            "message": f"Only {referral_rate*100:.1f}% customers from referrals. Huge growth opportunity.",
-            "action": "Create referral program with incentives"
+            "metric": "Khách được giới thiệu",
+            "message": f"Tỷ lệ khách có nguồn giới thiệu đã ghi nhận: {referral_rate*100:.1f}%.",
+            "action": "Bổ sung nguồn khách hàng để đối chiếu hiệu quả giới thiệu"
         })
 
     if activation_rate > 0.5:
         insights.append({
             "type": "success",
-            "metric": "Activation",
-            "message": f"Strong activation rate ({activation_rate*100:.1f}%). Keep this momentum!",
-            "action": "Document what works and scale acquisition"
+            "metric": "Mua lần đầu",
+            "message": f"Tỷ lệ mua lần đầu trong dữ liệu hiện tại: {activation_rate*100:.1f}%.",
+            "action": "Đối chiếu quy mô mẫu và kỳ quan sát trước khi mở rộng hoạt động thu hút khách"
         })
 
-    revenue_prev_period = total_revenue - revenue_30d
+    if not customers or not orders:
+        insights = []
+
+    revenue_prev_period = sum(compute_order_totals(order)['revenue'] for order in orders
+                              if sixty_days_ago.date() <= order.date < thirty_days_ago.date())
     if revenue_prev_period > 0:
-        revenue_growth = round((revenue_30d / revenue_prev_period * 100), 1)
+        revenue_growth = round(((revenue_30d - revenue_prev_period) / revenue_prev_period * 100), 1)
     else:
-        revenue_growth = 100.0 if revenue_30d > 0 else 0.0
+        revenue_growth = None
 
     return {
         "funnel": funnel_data,
@@ -477,7 +489,9 @@ async def get_aarrr_metrics():
 
 @router.get("/customers/lifecycle-analysis")
 async def customer_lifecycle_analysis():
-    compute_customer_metrics()
+    customers = _persisted_customers()
+    orders = _persisted_orders()
+    compute_customer_metrics(customers, orders)
     today = date.today()
 
     segments = {
@@ -548,6 +562,8 @@ async def customer_lifecycle_analysis():
 
 @router.get("/customers/cohort-analysis")
 async def get_cohort_analysis():
+    orders = _persisted_orders()
+    customers = _persisted_customers()
     cohorts = defaultdict(list)
     for customer in customers:
         cohort_month = customer.created_at.strftime("%Y-%m")
@@ -562,8 +578,9 @@ async def get_cohort_analysis():
         revenue_by_month = {}
 
         for i in range(12):
-            month_start = cohort_start + timedelta(days=30 * i)
-            month_end = month_start + timedelta(days=30)
+            month_number = cohort_start.month - 1 + i
+            month_start = datetime(cohort_start.year + month_number // 12, month_number % 12 + 1, 1)
+            month_end = datetime(cohort_start.year + (month_number + 1) // 12, (month_number + 1) % 12 + 1, 1)
 
             active_in_month = set()
             revenue_in_month = 0
@@ -615,13 +632,13 @@ async def get_cohort_analysis():
         "insights": [
             {
                 "type": "info",
-                "message": f"Month 1 retention: {avg_month_1_retention:.1f}%. Industry benchmark for handmade: 25-35%"
+                "message": f"Tỷ lệ khách quay lại sau 1 tháng: {avg_month_1_retention:.1f}%."
             },
             {
-                "type": "warning" if avg_month_3_retention < 15 else "success",
-                "message": f"Month 3 retention: {avg_month_3_retention:.1f}%. {'Need improvement' if avg_month_3_retention < 15 else 'Good performance'}"
+                "type": "info",
+                "message": f"Tỷ lệ khách quay lại sau 3 tháng: {avg_month_3_retention:.1f}%. Đánh giá cùng quy mô và thời gian theo dõi của từng nhóm khách."
             }
-        ]
+        ] if cohort_data else []
     }
 
 
@@ -629,6 +646,11 @@ async def get_cohort_analysis():
 
 @router.get("/analytics/signals")
 async def detect_signals():
+    from models.content import DemandSignalTable
+    from models.product import ProductReviewTable
+    orders = _persisted_orders()
+    demand_signals = _persisted_rows(DemandSignalTable)
+    product_reviews = _persisted_rows(ProductReviewTable)
     now = datetime.utcnow()
     thirty_days_ago = now - timedelta(days=30)
     sixty_days_ago = now - timedelta(days=60)
@@ -742,7 +764,8 @@ async def detect_signals():
             "critical_signals": total_critical,
             "high_signals": total_high,
             "medium_signals": total_medium,
-            "health_status": "critical" if total_critical > 0 else "warning" if total_high > 2 else "good"
+            "health_status": 'unknown' if not (orders or demand_signals or product_reviews)
+                             else "critical" if total_critical > 0 else "warning" if total_high > 2 else "good"
         },
         "period": {
             "current": f"{current_period_start.strftime('%Y-%m-%d')} to {current_period_end.strftime('%Y-%m-%d')}",
@@ -1007,6 +1030,10 @@ async def analyze_funnel(product_id: Optional[int] = None):
 
 @router.get("/analytics/market-benchmark/{product_id}")
 async def get_market_benchmark(product_id: int):
+    from models.product import ProductReviewTable, ProductImageTable, PriceChangeTable
+    product_reviews = _persisted_rows(ProductReviewTable)
+    product_images = _persisted_rows(ProductImageTable)
+    price_changes = _persisted_rows(PriceChangeTable)
     product = next((p for p in products if p.id == product_id), None)
     if not product:
         raise HTTPException(status_code=404, detail="Product not found")

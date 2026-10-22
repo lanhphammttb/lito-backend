@@ -2,7 +2,7 @@
 from typing import List, Optional
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 from config.database import engine, upsert_mongo, delete_mongo
 from config.settings import settings
@@ -652,20 +652,28 @@ async def adjust_finished_qty(
     user: User = Depends(get_current_user)
 ):
     """Adjust finished_qty for a product. payload: { quantity_change: int, note: str? }"""
-    product = find_product(product_id)
-    delta = int(payload.get("quantity_change", 0))
+    delta = payload.get("quantity_change", 0)
+    if type(delta) is not int:
+        raise HTTPException(422, 'Số lượng điều chỉnh thành phẩm phải là số nguyên')
     if delta == 0:
         raise HTTPException(status_code=400, detail="Số lượng thay đổi không được bằng 0")
-    product.finished_qty = max(0, getattr(product, "finished_qty", 0) + delta)
-    from datetime import datetime
-    product.updated_at = utcnow()
-    save_product_sql(product)
+    with Session(engine) as session:
+        row = session.exec(select(ProductTable).where(ProductTable.id == product_id).with_for_update()).first()
+        if not row:
+            raise HTTPException(404, 'Sản phẩm không tồn tại')
+        quantity = (row.finished_qty or 0) + delta
+        if quantity < 0:
+            raise HTTPException(409, 'Số lượng điều chỉnh vượt tồn thành phẩm hiện có')
+        row.finished_qty = quantity
+        row.updated_at = utcnow()
+        session.add(row)
+        session.commit()
     log_activity(user.id, "product", product_id, "adjust_finished", {
         "change": delta,
-        "new_qty": product.finished_qty,
+        "new_qty": quantity,
         "note": payload.get("note", "")
     })
-    return {"ok": True, "product_id": product_id, "finished_qty": product.finished_qty}
+    return {"ok": True, "product_id": product_id, "finished_qty": quantity}
 
 
 @router.put("/{product_id}/facebook-post-id")

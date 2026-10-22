@@ -4,10 +4,13 @@ from fastapi.responses import RedirectResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlmodel import Session, select
 import httpx
+import jwt
+import secrets
+from datetime import timedelta
 from urllib.parse import urlencode
 
 from config.database import engine
-from config.settings import settings as app_settings, FRONTEND_URL, FACEBOOK_REDIRECT_URI
+from config.settings import settings as app_settings, FRONTEND_URL, FACEBOOK_REDIRECT_URI, JWT_SECRET, JWT_ALGO
 from models.settings_table import SettingsTable
 from schemas.auth import LoginRequest, TokenResponse
 from services.auth import (
@@ -25,7 +28,24 @@ router = APIRouter()
 
 def _facebook_frontend_redirect(**params):
     """The admin frontend uses HashRouter, including OAuth result parameters."""
-    return RedirectResponse(f"{FRONTEND_URL.rstrip('/')}/#/settings?{urlencode(params)}")
+    response = RedirectResponse(f"{FRONTEND_URL.rstrip('/')}/#/settings?{urlencode(params)}")
+    response.delete_cookie('facebook_oauth_state', path='/auth/facebook')
+    return response
+
+
+def _validate_facebook_ticket(ticket):
+    try:
+        data = jwt.decode(ticket, JWT_SECRET, algorithms=[JWT_ALGO], audience='facebook-oauth',
+                          options={'require': ['exp', 'sub', 'nonce', 'aud']})
+        with Session(engine) as session:
+            user = session.get(UserTable, int(data['sub']))
+            if not user:
+                raise ValueError('Unknown user')
+            from services.auth import require_admin
+            require_admin(user)
+        return data
+    except (jwt.InvalidTokenError, ValueError, TypeError, HTTPException):
+        raise HTTPException(403, 'Phiên kết nối Facebook không hợp lệ hoặc đã hết hạn; hãy kết nối lại từ Cài đặt') from None
 
 
 def _do_login(email: str, password: str) -> TokenResponse:
@@ -145,27 +165,48 @@ async def change_password(
     return {"message": "Đổi mật khẩu thành công"}
 
 
+@router.post('/facebook/start')
+async def prepare_facebook_oauth(user: User = Depends(get_current_user)):
+    from services.auth import require_admin
+    require_admin(user)
+    if not app_settings.facebook_app_id or not app_settings.facebook_app_secret:
+        raise HTTPException(422, 'Lưu App ID và App Secret trước khi kết nối Facebook')
+    ticket = jwt.encode({'sub': str(user.id), 'aud': 'facebook-oauth', 'nonce': secrets.token_urlsafe(32),
+                         'exp': utcnow() + timedelta(minutes=5)}, JWT_SECRET, algorithm=JWT_ALGO)
+    # Set the cookie on a top-level API navigation, including when API and admin have different origins.
+    return {'url': FACEBOOK_REDIRECT_URI.rsplit('/callback', 1)[0] + '?' + urlencode({'ticket': ticket})}
+
+
 @router.get("/facebook")
-async def facebook_oauth_start(request: Request):
-    """Redirect user to Facebook OAuth consent screen."""
+async def facebook_oauth_start(request: Request, ticket: str = ''):
+    """Start consent only with a short-lived ticket issued to an authenticated admin."""
+    _validate_facebook_ticket(ticket)
     app_id = getattr(app_settings, "facebook_app_id", None)
     if not app_id:
         return _facebook_frontend_redirect(facebook_error="Chưa có cấu hình Facebook App ID được lưu trên hệ thống")
     redirect_uri = FACEBOOK_REDIRECT_URI
     scope = "pages_show_list,pages_read_engagement,pages_read_user_content,instagram_basic,instagram_manage_insights"
-    fb_url = (
-        f"https://www.facebook.com/dialog/oauth"
-        f"?client_id={app_id}"
-        f"&redirect_uri={redirect_uri}"
-        f"&scope={scope}"
-        f"&response_type=code"
-    )
-    return RedirectResponse(fb_url)
+    fb_url = 'https://www.facebook.com/dialog/oauth?' + urlencode({
+        'client_id': app_id, 'redirect_uri': redirect_uri, 'scope': scope,
+        'response_type': 'code', 'state': ticket})
+    response = RedirectResponse(fb_url)
+    response.headers['Cache-Control'] = 'no-store'
+    response.headers['Referrer-Policy'] = 'no-referrer'
+    response.set_cookie('facebook_oauth_state', ticket, max_age=300, httponly=True,
+                        secure=FACEBOOK_REDIRECT_URI.startswith('https://'), samesite='lax', path='/auth/facebook')
+    return response
 
 
 @router.get("/facebook/callback")
-async def facebook_oauth_callback(request: Request, code: str = None, error: str = None):
+async def facebook_oauth_callback(request: Request, code: str = None, error: str = None, state: str = ''):
     """Handle Facebook OAuth callback, save page token to settings."""
+    cookie = request.cookies.get('facebook_oauth_state', '')
+    if not state or not cookie or not secrets.compare_digest(state, cookie):
+        return _facebook_frontend_redirect(facebook_error='Phiên kết nối không hợp lệ; hãy kết nối lại từ Cài đặt')
+    try:
+        _validate_facebook_ticket(state)
+    except HTTPException:
+        return _facebook_frontend_redirect(facebook_error='Phiên kết nối đã hết hạn; hãy kết nối lại từ Cài đặt')
     if error or not code:
         return _facebook_frontend_redirect(facebook_error=error or 'cancelled')
 

@@ -1,5 +1,5 @@
 """Order services."""
-from typing import Dict, List
+from typing import Dict, List, Any
 from fastapi import HTTPException
 
 from config.settings import ORDER_STATUS_ALLOWED
@@ -30,6 +30,36 @@ def set_data_stores(o, r, p, s, m):
     materials = m
 
 
+def order_lines_from_row(row):
+    import json
+    try:
+        stored = json.loads(row.order_lines_json or '[]')
+    except (ValueError, TypeError):
+        stored = []
+    if row.lines:
+        result = []
+        for index, line in enumerate(sorted(row.lines, key=lambda item: item.id)):
+            values = {key: getattr(line, key) for key in ('product_id', 'variant_id', 'quantity', 'unit_price')}
+            if index < len(stored) and all(stored[index].get(key) == value for key, value in values.items()):
+                values['unit_cost_snapshot'] = stored[index].get('unit_cost_snapshot')
+            result.append(OrderLine(**values))
+        return result
+    return [OrderLine(**values) for values in stored]
+
+
+def snapshot_order_costs(order, previous_lines=()):
+    previous = {(line.product_id, line.variant_id): line.unit_cost_snapshot for line in previous_lines
+                if line.unit_cost_snapshot is not None}
+    for line in order.order_lines:
+        key = (line.product_id, line.variant_id)
+        if key in previous:
+            line.unit_cost_snapshot = previous[key]
+        else:
+            costs = compute_product_cost(find_product(line.product_id))
+            line.unit_cost_snapshot = sum(costs.get(field, 0) for field in
+                ('material_cost', 'labor_cost', 'packaging_cost', 'marketing_cost', 'platform_fee_amount', 'other_cost'))
+
+
 def find_order(order_id: int):
     """Find order by ID using Database."""
     from sqlmodel import Session
@@ -42,14 +72,7 @@ def find_order(order_id: int):
         if not row:
             raise HTTPException(status_code=404, detail=f"Order {order_id} không tồn tại")
             
-        lines = []
-        if getattr(row, "lines", None):
-            lines = [OrderLine(product_id=l.product_id, quantity=l.quantity, unit_price=l.unit_price, variant_id=l.variant_id) for l in row.lines]
-        elif row.order_lines_json:
-            try:
-                lines = [OrderLine(**l) for l in json.loads(row.order_lines_json)]
-            except Exception:
-                pass
+        lines = order_lines_from_row(row)
                 
         shipping_updates = []
         if getattr(row, "shipping_updates_json", None):
@@ -91,6 +114,14 @@ def validate_order_payload(payload):
         raise HTTPException(status_code=400, detail="Đơn hàng phải có ít nhất 1 sản phẩm")
     for line in payload.order_lines:
         find_product(line.product_id)
+        if line.variant_id is not None:
+            from sqlmodel import Session
+            from config.database import engine
+            from models.product import ProductVariantTable
+            with Session(engine) as session:
+                variant = session.get(ProductVariantTable, line.variant_id)
+                if not variant or variant.product_id != line.product_id:
+                    raise HTTPException(422, 'Biến thể không thuộc sản phẩm đã chọn')
         if line.quantity <= 0:
             raise HTTPException(status_code=400, detail="Số lượng phải > 0")
         if line.unit_price < 0:
@@ -136,17 +167,10 @@ def apply_promo(payload):
             payload.discount = discount
 
 
-def compute_order_totals(order) -> Dict[str, float]:
+def compute_order_totals(order) -> Dict[str, Any]:
     """Compute order totals including revenue, cost, profit."""
     gross = sum(line.unit_price * line.quantity for line in order.order_lines)
     discount = order.discount
-
-    # Re-apply promo if active
-    if getattr(order, "promo_code", None):
-        promo = next((p for p in promo_codes if p.code.lower() == order.promo_code.lower() and p.is_active), None)
-        if promo:
-            promo_discount = compute_promo_discount(promo, order.order_lines)
-            discount = max(discount, promo_discount)
 
     returns_amount = sum(
         r.refund_amount or r.amount
@@ -158,6 +182,9 @@ def compute_order_totals(order) -> Dict[str, float]:
     cost = order.shipping_fee
 
     for line in order.order_lines:
+        if getattr(line, 'unit_cost_snapshot', None) is not None:
+            cost += line.unit_cost_snapshot * line.quantity
+            continue
         try:
             product = find_product(line.product_id)
             product_cost = compute_product_cost(product)
@@ -167,6 +194,7 @@ def compute_order_totals(order) -> Dict[str, float]:
                 + product_cost.get("packaging_cost", 0)
                 + product_cost.get("marketing_cost", 0)
                 + product_cost.get("platform_fee_amount", 0)
+                + product_cost.get("other_cost", 0)
             ) * line.quantity
         except Exception:
             pass
@@ -178,6 +206,9 @@ def compute_order_totals(order) -> Dict[str, float]:
         "cost": round(cost, 2),
         "profit": round(profit, 2),
         "computed_discount": round(discount, 2),
+        "cost_is_estimated": True,
+        "cost_basis": 'saved_estimate' if all(getattr(line, 'unit_cost_snapshot', None) is not None for line in order.order_lines)
+                      else 'current_bom_estimate',
     }
 
 

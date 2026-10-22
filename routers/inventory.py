@@ -107,6 +107,8 @@ async def inventory_summary(user: User = Depends(get_current_user)):
             from services.stock_ledger import calculate_product_material_requirements
             min_units = float("inf")
             for mid, needed in calculate_product_material_requirements(p, 1).items():
+                if needed <= 0:
+                    continue
                 mat = material_map.get(mid)
                 if mat:
                     max_for_mat = (mat.available_qty or 0) / needed

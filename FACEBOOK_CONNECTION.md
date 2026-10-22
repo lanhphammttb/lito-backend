@@ -1,5 +1,9 @@
 # Kiểm tra kết nối Facebook — cập nhật 23/10/2026
 
+## Cập nhật sau kiểm tra tổng thể
+
+DNS `api.litohandmade.com` đã chuyển sang backend Vercel và xác minh hoạt động; phần mô tả AWS bên dưới là lịch sử trước khi sửa. Callback vẫn là `https://api.litohandmade.com/auth/facebook/callback`. Luồng mới bắt đầu bằng `POST /auth/facebook/start` với token ADMIN, sau đó chuyển trang qua vé có hạn để đặt cookie và mở Meta. Callback kiểm tra state/cookie và quyền quản trị viên trước khi lưu. Các kiểm thử dùng Meta giả lập; vẫn cần người dùng cấp quyền Trang thật để khôi phục kết nối, không có Page token để tự phục hồi.
+
 ## Trạng thái đã xác minh
 
 Lần kiểm tra đầu, Neon không lưu các trường Facebook. Kiểm tra lại sau đó cho thấy App ID và App Secret đã có, nhưng Page ID, Page token và Instagram ID vẫn trống. API production báo thiếu kết nối trước khi gọi Meta. Các DB SQLite cục bộ và bản sao trong thư mục kiểm thử không có cấu hình để khôi phục. Không thể kết luận token hết hạn từ thông báo này.

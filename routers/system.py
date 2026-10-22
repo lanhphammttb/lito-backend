@@ -3,6 +3,8 @@
 from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 from sqlmodel import Session, select
 
 from config.database import engine
@@ -10,7 +12,7 @@ from legacy_state import users
 from models import OrderTable
 from models.user import User
 from routers.tasks import tasks
-from services.auth import get_current_user, get_current_user_ws
+from services.auth import get_current_user, get_current_user_ws, require_admin
 from services.material import get_low_stock_alerts
 from services.notification import ws_manager
 from utils.datetime import utcnow
@@ -69,8 +71,13 @@ async def list_issue_templates(user: User = Depends(get_current_user)):
 
 @router.post("/backup")
 async def create_backup(user: User = Depends(get_current_user)):
-    """Create system backup."""
-    return {"success": True, "backup_id": utcnow().strftime("%Y%m%d_%H%M%S")}
+    """Download an actual consistent database snapshot for an administrator."""
+    require_admin(user)
+    from services.backup import export_snapshot
+    snapshot = await run_in_threadpool(export_snapshot, engine)
+    filename = f"lito-backup-{utcnow().strftime('%Y%m%d-%H%M%S')}.json"
+    return JSONResponse(snapshot, headers={'Content-Disposition': f'attachment; filename="{filename}"',
+                                          'Cache-Control': 'no-store'})
 
 
 @router.websocket("/ws")

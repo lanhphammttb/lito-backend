@@ -47,6 +47,9 @@ def save_production_job_sql(job: ProductionJob):
             if engine.dialect.name == "postgresql":
                 from sqlalchemy import text
                 session.exec(text("LOCK TABLE production_jobs IN SHARE ROW EXCLUSIVE MODE"))
+            if job.order_id:
+                from services.fulfillment import validate_job_quantity
+                validate_job_quantity(session, job.order_id, job.product_id, job.quantity)
             # Legacy rows used explicit IDs; their sequence may be behind MAX(id).
             highest = session.exec(select(ProductionJobTable.id).order_by(ProductionJobTable.id.desc())).first() or 0
             job.id = highest + 1
@@ -237,6 +240,9 @@ async def update_production_job(job_id: int, payload: ProductionJobUpdate, user:
             if job.status != "planned":
                 raise HTTPException(409, "Chỉ sửa số lượng/nguyên liệu khi job còn ở kế hoạch")
             new_quantity = payload.quantity or job.quantity
+            if job.order_id and new_quantity > job.quantity:
+                from services.fulfillment import validate_job_quantity
+                validate_job_quantity(session, job.order_id, job.product_id, new_quantity, job.id)
             if payload.materials is not None:
                 job.materials = _plan_materials(find_product(job.product_id), new_quantity, payload.materials, previous=job.materials)
             else:

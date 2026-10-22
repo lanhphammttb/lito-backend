@@ -109,7 +109,7 @@ async def get_customer_lifecycle(user: User = Depends(get_current_user)):
         }
 
 
-@router.api_route("/auto-tag", methods=["GET", "POST"])
+@router.post("/auto-tag")
 async def auto_tag_customers(user: User = Depends(get_current_user)):
     """Auto-tag customers based on RFM analysis from Database."""
     from sqlmodel import select

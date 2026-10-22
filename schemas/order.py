@@ -1,7 +1,7 @@
 """Order schemas."""
 import datetime
 from typing import Optional, List
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, Field
 from models.order import OrderLine
 
 
@@ -11,8 +11,8 @@ class OrderCreate(BaseModel):
     channel: Optional[str] = None
     customer_id: Optional[int] = None
     order_lines: List[OrderLine] = []
-    shipping_fee: float = 0
-    discount: float = 0
+    shipping_fee: float = Field(default=0, ge=0, allow_inf_nan=False)
+    discount: float = Field(default=0, ge=0, allow_inf_nan=False)
     promo_code: Optional[str] = None
     status: str = "pending"
     payment_status: str = "unpaid"

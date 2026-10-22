@@ -31,7 +31,7 @@ class IssueFromTemplateRequest(BaseModel):
     priority: Optional[int] = None
 
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(get_current_user)])
 current_user = User(id=1, email="admin@hala.vn", role="admin", name="Admin", password_hash="dummy")
 
 issues: List = []
