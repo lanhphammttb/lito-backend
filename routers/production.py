@@ -9,22 +9,13 @@ from sqlmodel import Session
 from config.database import engine
 from models.user import User
 from models.production import ProductionJob, ProductionJobTable, ProductionMaterial
-from schemas.production import ProductionJobCreate, ProductionJobStatusUpdate
+from schemas.production import ProductionJobCreate, ProductionJobStatusUpdate, ProductionJobUpdate
 from services.auth import get_current_user
-from services.order import find_order, reserve_stock_for_order, release_reserved_stock_for_order
-from services.stock_ledger import (
-    calculate_product_material_requirements,
-    has_reserved_materials_for_order,
-    consume_reserved_materials_for_order,
-    release_materials_for_job,
-    consume_materials_for_job,
-    _material_state,
-    _reserved_balance_for,
-)
+from services.order import find_order
 from services.product import find_product
 from services.material import find_material
 from services.notification import ws_manager
-from routers.products import save_product_sql
+from utils.quantities import effective_quantity
 
 from sqlmodel import select
 router = APIRouter()
@@ -52,8 +43,17 @@ async def _broadcast_low_stock(material_ids):
 def save_production_job_sql(job: ProductionJob):
     materials_json = json.dumps([m.model_dump(mode="json") for m in job.materials])
     with Session(engine) as session:
+        if not job.id:
+            if engine.dialect.name == "postgresql":
+                from sqlalchemy import text
+                session.exec(text("LOCK TABLE production_jobs IN SHARE ROW EXCLUSIVE MODE"))
+            # Legacy rows used explicit IDs; their sequence may be behind MAX(id).
+            highest = session.exec(select(ProductionJobTable.id).order_by(ProductionJobTable.id.desc())).first() or 0
+            job.id = highest + 1
         row = session.get(ProductionJobTable, job.id)
         if row:
+            row.quantity = job.quantity
+            row.planned_minutes = job.planned_minutes
             row.status = job.status
             row.assigned_to = job.assigned_to
             row.notes = job.notes
@@ -64,7 +64,7 @@ def save_production_job_sql(job: ProductionJob):
             row.updated_at = job.updated_at
         else:
             row = ProductionJobTable(
-                id=job.id,
+                id=job.id or None,
                 order_id=job.order_id,
                 product_id=job.product_id,
                 product_name=job.product_name,
@@ -83,6 +83,8 @@ def save_production_job_sql(job: ProductionJob):
             )
         session.add(row)
         session.commit()
+        session.refresh(row)
+        job.id = row.id
 
 
 
@@ -136,14 +138,11 @@ async def create_production_job(
                 status_code=400,
                 detail=f"Đơn #{payload.order_id} cần ở trạng thái confirmed hoặc processing (hiện tại: {order.status})"
             )
-
-    requirements = calculate_product_material_requirements(product, payload.quantity)
-    with Session(engine) as session:
-        new_id = session.exec(select(ProductionJobTable.id).order_by(ProductionJobTable.id.desc())).first() or 0
-        new_id += 1
+        if not any(line.product_id == payload.product_id for line in order.order_lines):
+            raise HTTPException(400, "Sản phẩm không thuộc đơn hàng đã chọn")
 
     job = ProductionJob(
-        id=new_id,
+        id=0,
         order_id=payload.order_id,
         product_id=payload.product_id,
         product_name=product.name,
@@ -153,124 +152,175 @@ async def create_production_job(
         notes=payload.notes,
         planned_minutes=(product.time_minutes or 0) * payload.quantity,
         due_at=payload.due_at,
-        materials=[
-            ProductionMaterial(material_id=mid, planned_quantity=qty, reserved_quantity=0)
-            for mid, qty in requirements.items()
-        ],
+        materials=_plan_materials(product, payload.quantity, payload.materials),
         created_by=user.id,
         created_at=datetime.utcnow(),
         updated_at=datetime.utcnow(),
     )
     save_production_job_sql(job)
+    if not is_mts:
+        # Migrate only remaining legacy order reservations to job-level planning.
+        from services.stock_ledger import release_legacy_order_reservations
+        release_legacy_order_reservations(order.id, user.id)
+    return job
+
+
+def _load_job(row):
+    return ProductionJob(**{**row.model_dump(), "materials": json.loads(row.materials_json or "[]")})
+
+
+def _plan_materials(product, quantity, selected):
+    usages = selected if selected is not None else product.materials
+    materials = {}
+    for source in usages:
+        mid = source.material_id
+        mat = find_material(mid)
+        product_wastage = getattr(source, "product_wastage_percent", None)
+        if product_wastage is None:
+            product_wastage = product.wastage_percent
+        per_product = effective_quantity(source.quantity, product_wastage, source.wastage_percent, mat.unit_type)
+        needed = round(per_product * quantity, 4)
+        if mid in materials:
+            materials[mid].planned_quantity += needed
+            materials[mid].quantity_per_product = None
+            continue
+        materials[mid] = ProductionMaterial(
+            material_id=mid, planned_quantity=needed,
+            quantity_per_product=source.quantity,
+            wastage_percent=source.wastage_percent,
+            product_wastage_percent=product_wastage,
+            material_name=mat.name, unit=mat.unit, unit_type=mat.unit_type,
+            unit_price=mat.unit_price,
+        )
+    return list(materials.values())
+
+
+@router.put("/{job_id}")
+async def update_production_job(job_id: int, payload: ProductionJobUpdate, user: User = Depends(get_current_user)):
+    with Session(engine) as session:
+        row = session.exec(select(ProductionJobTable).where(ProductionJobTable.id == job_id).with_for_update()).first()
+        if not row:
+            raise HTTPException(404, "Job không tồn tại")
+        if row.status in {"completed", "cancelled"}:
+            raise HTTPException(409, "Job đã kết thúc, không thể sửa")
+        job = _load_job(row)
+        fields = payload.model_fields_set
+        if fields & {"quantity", "materials"}:
+            if job.status != "planned":
+                raise HTTPException(409, "Chỉ sửa số lượng/nguyên liệu khi job còn ở kế hoạch")
+            new_quantity = payload.quantity or job.quantity
+            if payload.materials is not None:
+                job.materials = _plan_materials(find_product(job.product_id), new_quantity, payload.materials)
+            else:
+                for material in job.materials:
+                    material.planned_quantity = round(material.planned_quantity * new_quantity / job.quantity, 4)
+            job.planned_minutes = round(job.planned_minutes * new_quantity / job.quantity)
+            job.quantity = new_quantity
+        for key in ("assigned_to", "due_at", "notes"):
+            if key in fields:
+                setattr(job, key, getattr(payload, key))
+        job.updated_at = datetime.utcnow()
+        for key in ("quantity", "planned_minutes", "assigned_to", "due_at", "notes", "updated_at"):
+            setattr(row, key, getattr(job, key))
+        row.materials_json = json.dumps([m.model_dump() for m in job.materials])
+        session.add(row)
+        session.commit()
     return job
 
 
 @router.patch("/{job_id}/status")
-async def update_production_job_status(
-    job_id: int,
-    payload: ProductionJobStatusUpdate,
-    user: User = Depends(get_current_user),
-):
-    """
-    Chỉ in_progress mới trừ kho (consume).
-    completed chỉ đánh dấu hoàn thành — NVL đã trừ từ lúc in_progress.
-    cancelled trước in_progress → release reserve.
-    cancelled sau in_progress → 409, phải xử lý thủ công.
-    """
+async def update_production_job_status(job_id: int, payload: ProductionJobStatusUpdate, user: User = Depends(get_current_user)):
+    # Lock the job and material rows; stock, movements and status commit together.
+    from models.material import MaterialTable, StockMovementTable, MaterialBatchTable
+    from models.product import ProductTable
+    allowed = {
+        "planned": {"reserved", "in_progress", "completed", "cancelled"},
+        "reserved": {"planned", "in_progress", "completed", "cancelled"},
+        "in_progress": {"paused", "completed"},
+        "paused": {"in_progress", "completed"},
+        "completed": set(), "cancelled": set(),
+    }
     with Session(engine) as session:
-        row = session.get(ProductionJobTable, job_id)
+        row = session.exec(select(ProductionJobTable).where(ProductionJobTable.id == job_id).with_for_update()).first()
         if not row:
-            raise HTTPException(status_code=404, detail="Production job không tồn tại")
-        
-        job = ProductionJob(**row.model_dump())
-        try:
-            materials_dicts = json.loads(row.materials_json or '[]')
-            job.materials = [ProductionMaterial(**m) for m in materials_dicts]
-        except:
-            job.materials = []
-
-    old_status = job.status
-    new_status = payload.status
-    if old_status == new_status:
-        return job
-
-    product = find_product(job.product_id)
-    requirements = calculate_product_material_requirements(product, job.quantity)
-    is_mts = job.order_id is None
-
-    # ── in_progress: đây là điểm DUY NHẤT trừ kho ──────────────────────────
-    if new_status == "in_progress" and old_status != "in_progress":
-        if is_mts:
-            # MTS: reserve + consume ngay (validate ở đây)
-            consume_materials_for_job(job, requirements, user)
-        else:
-            order = find_order(job.order_id)
-            # MTO: reserve toàn đơn nếu chưa, sau đó consume phần của job này
-            if not has_reserved_materials_for_order(order.id):
-                reserve_stock_for_order(order, user)
-            # validate: phần còn lại trong reservation đủ cho job này không?
+            raise HTTPException(404, "Job không tồn tại")
+        job = _load_job(row)
+        target = payload.status
+        if target == job.status:
+            return job
+        if target not in allowed.get(job.status, set()):
+            raise HTTPException(409, "Không thể chuyển trạng thái này; nguyên liệu đã dùng cần điều chỉnh kho riêng")
+        if job.order_id:
+            from services.stock_ledger import release_legacy_order_reservations
+            release_legacy_order_reservations(job.order_id, user.id)
+        # Older versions allowed planned -> paused without consuming anything.
+        started = bool(job.started_at or any(m.actual_quantity > 0 for m in job.materials))
+        if not started:
             shortages = []
-            for mat_id, needed in requirements.items():
-                remaining = _reserved_balance_for("order", order.id, mat_id)
-                if remaining < needed:
-                    _, on_hand, reserved, _ = _material_state(mat_id)
-                    shortages.append({
-                        "material_id": mat_id,
-                        "needed": needed,
-                        "reserved_remaining": remaining,
-                    })
+            for usage in sorted(job.materials, key=lambda m: m.material_id):
+                mat = session.exec(select(MaterialTable).where(MaterialTable.id == usage.material_id).with_for_update()).first()
+                if not mat:
+                    raise HTTPException(404, "Nguyên liệu của job không còn tồn tại")
+                on_hand = mat.on_hand_qty if mat.on_hand_qty is not None else mat.stock_quantity
+                if on_hand == 0 and mat.stock_quantity > 0:
+                    on_hand = mat.stock_quantity
+                own = usage.reserved_quantity
+                needed = usage.planned_quantity
+                available = on_hand - mat.reserved_qty + own
+                if target in {"reserved", "in_progress", "completed"} and available + 1e-8 < needed:
+                    shortages.append({"material_id": mat.id, "material_name": mat.name, "required_quantity": needed,
+                        "available_quantity": max(0, available), "unit_price": mat.unit_price})
+                    continue
+                def movement(kind, delta):
+                    session.add(StockMovementTable(material_id=mat.id, quantity_change=delta, movement_type=kind,
+                        reference_type="production_job", reference_id=job.id, user_id=user.id, note=f"Job #{job.id}"))
+                if target == "reserved":
+                    mat.reserved_qty += needed - own
+                    usage.reserved_quantity = needed
+                    movement("reserve", needed - own)
+                elif target in {"planned", "cancelled"}:
+                    if own:
+                        mat.reserved_qty -= own
+                        usage.reserved_quantity = 0
+                        movement("release", -own)
+                elif target in {"in_progress", "completed"}:
+                    mat.reserved_qty -= own
+                    on_hand -= needed
+                    usage.reserved_quantity = 0
+                    usage.actual_quantity = needed
+                    usage.unit_price = mat.unit_price
+                    movement("consume", -needed)
+                    remaining = needed
+                    for batch in session.exec(select(MaterialBatchTable).where(MaterialBatchTable.material_id == mat.id,
+                            MaterialBatchTable.quantity_remaining > 0).order_by(MaterialBatchTable.received_date).with_for_update()).all():
+                        delta = min(remaining, batch.quantity_remaining)
+                        batch.quantity_remaining -= delta
+                        remaining -= delta
+                        session.add(batch)
+                mat.stock_quantity = mat.on_hand_qty = round(on_hand, 4)
+                mat.available_qty = round(max(0, on_hand - mat.reserved_qty), 4)
+                session.add(mat)
             if shortages:
-                raise HTTPException(status_code=400, detail={
-                    "message": "Không đủ NVL đã reserve cho job này (các job khác trong đơn đã dùng hết?)",
-                    "shortages": shortages,
-                })
-            consume_reserved_materials_for_order(order, user, requirements)
-        job.started_at = job.started_at or datetime.utcnow()
-        await _broadcast_low_stock(requirements.keys())
-
-    # ── completed: consume nếu chưa, rồi đánh dấu xong ────────────────────
-    elif new_status == "completed":
-        if old_status not in {"in_progress", "paused"}:
-            # chưa qua in_progress → consume ngay bây giờ
-            if is_mts:
-                consume_materials_for_job(job, requirements, user)
-            else:
-                order = find_order(job.order_id)
-                if not has_reserved_materials_for_order(order.id):
-                    reserve_stock_for_order(order, user)
-                shortages = []
-                for mat_id, needed in requirements.items():
-                    remaining = _reserved_balance_for("order", order.id, mat_id)
-                    if remaining < needed:
-                        shortages.append({"material_id": mat_id, "needed": needed, "reserved_remaining": remaining})
-                if shortages:
-                    raise HTTPException(status_code=400, detail={"message": "Không đủ NVL", "shortages": shortages})
-                consume_reserved_materials_for_order(order, user, requirements)
-            await _broadcast_low_stock(requirements.keys())
-        job.completed_at = datetime.utcnow()
-        # Thêm vào tồn kho thành phẩm (MTS: dự trữ bán sau; MTO: đã có đơn nhưng vẫn cộng để theo dõi)
-        product.finished_qty = getattr(product, "finished_qty", 0) + job.quantity
-        save_product_sql(product)
-
-    # ── cancelled: release nếu chưa in_progress ─────────────────────────────
-    elif new_status == "cancelled":
-        if old_status == "in_progress":
-            raise HTTPException(
-                status_code=409,
-                detail="Job đã bắt đầu sản xuất và NVL đã bị trừ. Cần điều chỉnh kho thủ công."
-            )
-        if is_mts:
-            release_materials_for_job(job, requirements, user)
-        else:
-            order = find_order(job.order_id)
-            release_reserved_stock_for_order(order, user)
-
-    # ── paused: chỉ đổi status ──────────────────────────────────────────────
-    # (đã in_progress, NVL đã consume, tạm dừng không ảnh hưởng kho)
-
-    job.status = new_status
-    if payload.notes:
-        job.notes = payload.notes
-    job.updated_at = datetime.utcnow()
-    save_production_job_sql(job)
+                raise HTTPException(400, {"message": "Không đủ nguyên liệu đã chọn cho job", "shortages": shortages})
+        if target in {"in_progress", "completed"}:
+            job.started_at = job.started_at or datetime.utcnow()
+        if target == "completed":
+            product = session.exec(select(ProductTable).where(ProductTable.id == job.product_id).with_for_update()).first()
+            if not product:
+                raise HTTPException(404, "Sản phẩm không còn tồn tại")
+            product.finished_qty += job.quantity
+            session.add(product)
+            job.completed_at = datetime.utcnow()
+        job.status = target
+        if payload.notes is not None:
+            job.notes = payload.notes
+        job.updated_at = datetime.utcnow()
+        for key in ("status", "notes", "started_at", "completed_at", "updated_at"):
+            setattr(row, key, getattr(job, key))
+        row.materials_json = json.dumps([m.model_dump() for m in job.materials])
+        session.add(row)
+        session.commit()
+    from services.product import clear_product_cost_cache
+    clear_product_cost_cache()
+    await _broadcast_low_stock([m.material_id for m in job.materials])
     return job

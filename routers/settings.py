@@ -1,5 +1,6 @@
 """Settings routes."""
 from typing import Optional
+import json
 from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session, select
 
@@ -54,7 +55,7 @@ async def update_settings(
             row = SettingsTable(id=1)
         for key, value in payload.items():
             if hasattr(row, key):
-                setattr(row, key, value)
+                setattr(row, key, json.dumps(value) if key == "notification_emails" and value is not None else value)
         session.add(row)
         session.commit()
 
@@ -83,7 +84,15 @@ async def get_setting(key: str, user: User = Depends(get_current_user)):
         if row and hasattr(row, key):
             if user.role != "ADMIN" and key not in app_settings.public_dump():
                 raise HTTPException(status_code=403, detail=f"Setting {key} requires admin access")
-            return {"key": key, "value": getattr(row, key)}
+            value = getattr(row, key)
+            if key == "notification_emails" and isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except ValueError:
+                    value = [email.strip() for email in value.split(",") if email.strip()]
+                if not isinstance(value, list):
+                    value = []
+            return {"key": key, "value": value}
     
     # Check in-memory settings
     if hasattr(app_settings, key):
@@ -115,7 +124,7 @@ async def set_setting(
         if not row:
             row = SettingsTable(id=1)
         if hasattr(row, key):
-            setattr(row, key, value)
+            setattr(row, key, json.dumps(value) if key == "notification_emails" else value)
         else:
             raise HTTPException(status_code=404, detail=f"Setting {key} không tồn tại")
         session.add(row)

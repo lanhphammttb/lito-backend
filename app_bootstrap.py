@@ -118,6 +118,14 @@ def run_schema_migrations():
         )
         """,
         "CREATE INDEX IF NOT EXISTS ix_strategy_items_kind ON strategy_items (kind)",
+        "ALTER TABLE products ADD COLUMN facebook_post_id TEXT",
+        "ALTER TABLE settings ADD COLUMN facebook_page_id TEXT",
+        "ALTER TABLE settings ADD COLUMN facebook_page_access_token TEXT",
+        "ALTER TABLE settings ADD COLUMN facebook_page_name TEXT",
+        "ALTER TABLE settings ADD COLUMN facebook_app_id TEXT",
+        "ALTER TABLE settings ADD COLUMN facebook_app_secret TEXT",
+        "ALTER TABLE settings ADD COLUMN instagram_business_account_id TEXT",
+        "ALTER TABLE products ADD COLUMN instagram_post_id TEXT",
     ]
     with Session(engine) as session:
         for sql in migrations:
@@ -364,6 +372,12 @@ def load_settings_from_db():
                 if field == "id":
                     continue
                 val = getattr(row, field, None)
+                if field == "notification_emails" and isinstance(val, str):
+                    try:
+                        decoded = json.loads(val)
+                        val = decoded if isinstance(decoded, list) else []
+                    except (ValueError, TypeError):
+                        val = [email.strip() for email in val.split(",") if email.strip()]
                 if val is not None and hasattr(settings, field):
                     try:
                         setattr(settings, field, val)
@@ -437,6 +451,8 @@ def load_data_from_sql():
                 finished_qty=getattr(row, "finished_qty", 0) or 0,
                 created_by=row.created_by,
                 updated_by=row.updated_by,
+                facebook_post_id=getattr(row, "facebook_post_id", None),
+                instagram_post_id=getattr(row, "instagram_post_id", None),
                 materials=mat_usages, created_at=row.created_at, updated_at=row.updated_at,
             ))
 

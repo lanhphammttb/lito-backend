@@ -10,7 +10,7 @@ from models.user import User
 from models.product import (
     Product, ProductTable, ProductVariant, ProductVariantTable,
     ProductBundle, ProductBundleTable, ProductImage, ProductImageTable,
-    ProductReview, ProductReviewTable, MaterialUsage
+    ProductReview, ProductReviewTable, MaterialUsage, PriceChangeTable, LifecycleEventTable
 )
 from schemas.product import (
     ProductCreate, ProductVariantCreate, ProductBundleCreate,
@@ -26,12 +26,17 @@ from utils.datetime import utcnow
 import json
 
 
-def save_product_sql(product):
+def save_product_sql(product, *, record_history=False, changed_by=None, update_finished=True):
     """Upsert a product to SQL."""
     with Session(engine) as session:
-        row = session.get(ProductTable, product.id)
+        from sqlmodel import select
+        row = session.exec(select(ProductTable).where(ProductTable.id == product.id).with_for_update()).first()
         materials_json = json.dumps([m.model_dump(mode="json") if hasattr(m, "model_dump") else m.__dict__ for m in product.materials])
         if row:
+            if record_history and row.base_price != product.base_price:
+                session.add(PriceChangeTable(product_id=product.id, old_price=row.base_price, new_price=product.base_price, changed_by=changed_by))
+            if record_history and row.lifecycle_status != product.lifecycle_status:
+                session.add(LifecycleEventTable(product_id=product.id, status=product.lifecycle_status, changed_by=changed_by))
             row.name = product.name
             row.base_price = product.base_price
             row.time_minutes = product.time_minutes
@@ -49,7 +54,12 @@ def save_product_sql(product):
             row.marketing_cost = product.marketing_cost
             row.platform_fee_percent = product.platform_fee_percent
             row.cost_breakdown_json = json.dumps(product.cost_breakdown) if product.cost_breakdown else None
-            row.finished_qty = getattr(product, "finished_qty", 0) or 0
+            if update_finished:
+                row.finished_qty = getattr(product, "finished_qty", 0) or 0
+            else:
+                product.finished_qty = row.finished_qty
+            row.facebook_post_id = getattr(product, "facebook_post_id", None)
+            row.instagram_post_id = getattr(product, "instagram_post_id", None)
             row.updated_at = product.updated_at
         else:
             row = ProductTable(
@@ -72,6 +82,8 @@ def save_product_sql(product):
                 platform_fee_percent=product.platform_fee_percent,
                 cost_breakdown_json=json.dumps(product.cost_breakdown) if product.cost_breakdown else None,
                 finished_qty=getattr(product, "finished_qty", 0) or 0,
+                facebook_post_id=getattr(product, "facebook_post_id", None),
+                instagram_post_id=getattr(product, "instagram_post_id", None),
                 created_by=product.created_by,
                 created_at=product.created_at,
                 updated_at=product.updated_at,
@@ -446,6 +458,7 @@ async def create_product(
         marketing_cost=payload.marketing_cost or 0,
         platform_fee_percent=payload.platform_fee_percent or 0,
         cost_breakdown=payload.cost_breakdown,
+        facebook_post_id=payload.facebook_post_id,
         created_at=now,
         updated_at=now,
     )
@@ -458,6 +471,7 @@ async def create_product(
                 quantity=mat.quantity,
                 wastage_percent=getattr(mat, "wastage_percent", 0) or 0,
                 usage_unit=getattr(mat, "usage_unit", None),
+                alternative_material_ids=mat.alternative_material_ids,
             )
             product.materials.append(usage)
 
@@ -481,11 +495,12 @@ async def update_product(
     require_admin(user)
     product = find_product(product_id)
     before_data = product.__dict__.copy()
+    payload = ProductCreate(**{**product.model_dump(), **payload.model_dump(exclude_unset=True)})
 
     product.name = payload.name
     product.base_price = payload.base_price
     product.price = payload.base_price
-    product.time_minutes = payload.time_minutes or product.time_minutes
+    product.time_minutes = payload.time_minutes
     product.wastage_percent = getattr(payload, "wastage_percent", 0) or 0
     product.difficulty = payload.difficulty or product.difficulty
     product.notes = payload.notes
@@ -499,6 +514,7 @@ async def update_product(
     product.marketing_cost = payload.marketing_cost or 0
     product.platform_fee_percent = payload.platform_fee_percent or 0
     product.cost_breakdown = payload.cost_breakdown
+    product.facebook_post_id = payload.facebook_post_id
     product.updated_at = utcnow()
 
     # Update materials
@@ -510,12 +526,13 @@ async def update_product(
                 quantity=mat.quantity,
                 wastage_percent=getattr(mat, "wastage_percent", 0) or 0,
                 usage_unit=getattr(mat, "usage_unit", None),
+                alternative_material_ids=mat.alternative_material_ids,
             )
             product.materials.append(usage)
 
     clear_product_cost_cache(product_id)
 
-    save_product_sql(product)
+    save_product_sql(product, record_history=True, changed_by=user.id, update_finished=False)
     upsert_mongo("products", product.model_dump(mode="json") if hasattr(product, "model_dump") else product.__dict__)
     log_activity(user.id, "product", product_id, "update", {"name": product.name})
     await create_audit_log(user, "UPDATE", "products", product_id, before_data, product.__dict__, request)
@@ -647,3 +664,224 @@ async def adjust_finished_qty(
         "note": payload.get("note", "")
     })
     return {"ok": True, "product_id": product_id, "finished_qty": product.finished_qty}
+
+
+@router.put("/{product_id}/facebook-post-id")
+async def update_facebook_post_id(
+    product_id: int,
+    payload: dict,
+    user: User = Depends(get_current_user)
+):
+    """Update just the facebook_post_id for a product."""
+    require_admin(user)
+    product = find_product(product_id)
+    post_id = payload.get("facebook_post_id")
+    if post_id is not None:
+        post_id = post_id.strip()
+        if not post_id:
+            post_id = None
+
+    product.facebook_post_id = post_id
+    product.updated_at = utcnow()
+    save_product_sql(product)
+    upsert_mongo("products", product.model_dump(mode="json") if hasattr(product, "model_dump") else product.__dict__)
+    log_activity(user.id, "product", product_id, "link_facebook_post", {"facebook_post_id": post_id})
+    return {"ok": True, "facebook_post_id": post_id}
+
+
+@router.put("/{product_id}/instagram-post-id")
+async def update_instagram_post_id(
+    product_id: int,
+    payload: dict,
+    user: User = Depends(get_current_user)
+):
+    """Update just the instagram_post_id for a product."""
+    require_admin(user)
+    product = find_product(product_id)
+    post_id = payload.get("instagram_post_id")
+    if post_id is not None:
+        post_id = post_id.strip() or None
+
+    product.instagram_post_id = post_id
+    product.updated_at = utcnow()
+    save_product_sql(product)
+    upsert_mongo("products", product.model_dump(mode="json") if hasattr(product, "model_dump") else product.__dict__)
+    log_activity(user.id, "product", product_id, "link_instagram_post", {"instagram_post_id": post_id})
+    return {"ok": True, "instagram_post_id": post_id}
+
+
+@router.get("/{product_id}/instagram-insights")
+async def get_instagram_insights(
+    product_id: int,
+    user: User = Depends(get_current_user)
+):
+    """Retrieve details and insights for the linked Instagram post."""
+    import httpx
+    product = find_product(product_id)
+    media_id = product.instagram_post_id
+    if not media_id:
+        raise HTTPException(status_code=400, detail="Sản phẩm chưa được liên kết với bài viết Instagram nào")
+
+    token = settings.facebook_page_access_token
+    if not token:
+        raise HTTPException(status_code=400, detail="Chưa kết nối Facebook/Instagram trong Cài đặt")
+
+    _FB_API = "https://graph.facebook.com/v25.0"
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            meta_resp = await client.get(
+                f"{_FB_API}/{media_id}",
+                params={
+                    "fields": "id,caption,media_type,timestamp,like_count,comments_count,permalink,media_url,thumbnail_url",
+                    "access_token": token,
+                },
+            )
+            meta = meta_resp.json()
+            if "error" in meta:
+                raise HTTPException(status_code=400, detail=f"Lỗi Instagram API: {meta['error'].get('message')}")
+
+            # Valid insights metrics (likes/comments come from metadata, not insights)
+            media_type = meta.get("media_type", "IMAGE")
+            base_metrics = "impressions,reach,saved,total_interactions,shares,follows,profile_visits"
+            if media_type == "VIDEO":
+                base_metrics += ",video_views"
+
+            insights_resp = await client.get(
+                f"{_FB_API}/{media_id}/insights",
+                params={"metric": base_metrics, "access_token": token},
+            )
+            ins_data = insights_resp.json()
+            if "error" in ins_data:
+                print(f"[IG insights error] {ins_data['error']}")
+            insights = {}
+            for item in ins_data.get("data", []):
+                val = item.get("values", [{}])[0].get("value", 0) if item.get("values") else item.get("value", 0)
+                insights[item["name"]] = val
+
+        return {
+            "media_id": media_id,
+            "caption": meta.get("caption", ""),
+            "media_type": media_type,
+            "timestamp": meta.get("timestamp"),
+            "permalink": meta.get("permalink"),
+            "media_url": meta.get("media_url") or meta.get("thumbnail_url"),
+            "like_count": meta.get("like_count", 0),
+            "comments_count": meta.get("comments_count", 0),
+            "impressions": insights.get("impressions", 0),
+            "reach": insights.get("reach", 0),
+            "saved": insights.get("saved", 0),
+            "total_interactions": insights.get("total_interactions", 0),
+            "shares": insights.get("shares", 0),
+            "profile_visits": insights.get("profile_visits", 0),
+            "follows": insights.get("follows", 0),
+            "video_views": insights.get("video_views", 0),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Lỗi kết nối: {str(e)}")
+
+
+@router.get("/{product_id}/facebook-insights")
+async def get_facebook_insights(
+    product_id: int,
+    user: User = Depends(get_current_user)
+):
+    """Retrieve details and insights of the linked Facebook post from Graph API."""
+    product = find_product(product_id)
+    post_id = product.facebook_post_id
+    if not post_id:
+        raise HTTPException(status_code=400, detail="Sản phẩm chưa được liên kết với bài viết Facebook nào")
+
+    page_access_token = settings.facebook_page_access_token
+    if not page_access_token:
+        raise HTTPException(status_code=400, detail="Chưa cấu hình Facebook Page Access Token trong Cấu hình")
+
+    # Simulation fallback for development or testing
+    if page_access_token.startswith("mock") or post_id.startswith("mock") or post_id == "12345":
+        return {
+            "post_id": post_id,
+            "message": "Đây là bài viết mô phỏng giới thiệu sản phẩm mới tinh xảo handmade LITO! Cảm ơn cả nhà đã ủng hộ ❤️ #lito #handmade",
+            "created_time": utcnow().isoformat(),
+            "permalink_url": "https://facebook.com/litohandmade/posts/12345",
+            "full_picture": "https://placehold.co/600x400?text=LITO+Handmade+Mock+Post",
+            "shares_count": 45,
+            "comments_count": 89,
+            "impressions": 12450,
+            "reach": 8900,
+            "engaged_users": 1200,
+            "clicks": 450,
+            "reactions": {
+                "like": 320,
+                "love": 150,
+                "haha": 5,
+                "wow": 12,
+                "sorry": 0,
+                "anger": 0
+            },
+            "reactions_count": 487
+        }
+
+    import httpx
+    import re
+    page_id = getattr(settings, "facebook_page_id", None) or ""
+
+    # Normalize: nếu post_id là URL đầy đủ, extract post ID từ path
+    if post_id.startswith("http"):
+        try:
+            from urllib.parse import urlparse
+            path_parts = [p for p in urlparse(post_id).path.split("/") if p]
+            posts_idx = path_parts.index("posts") if "posts" in path_parts else -1
+            post_id = path_parts[posts_idx + 1] if posts_idx != -1 else path_parts[-1]
+        except Exception:
+            raise HTTPException(status_code=400, detail="Không thể đọc link bài viết. Vui lòng dùng ID số dạng: 877324125473060_122129...")
+
+    # pfbid format: ghép {page_id}_{pfbid} để gọi Meta Graph API
+    if post_id.startswith("pfbid") and page_id:
+        post_id = f"{page_id}_{post_id}"
+
+    # Nếu chỉ là post_id số thuần (không có page_id_), tự ghép
+    if re.fullmatch(r"\d+", post_id) and page_id:
+        post_id = f"{page_id}_{post_id}"
+
+    post_url = f"https://graph.facebook.com/v25.0/{post_id}"
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            # Request 1: basic post metadata
+            meta_resp = await client.get(
+                post_url,
+                params={
+                    "fields": "message,story,created_time,shares,comments.summary(true),permalink_url,full_picture",
+                    "access_token": page_access_token
+                }
+            )
+            if meta_resp.status_code != 200:
+                err_detail = meta_resp.json().get("error", {}).get("message", "Lỗi Graph API")
+                raise HTTPException(status_code=meta_resp.status_code, detail=f"Lỗi Facebook API: {err_detail}")
+            meta_data = meta_resp.json()
+
+            # Request 2: reactions by type
+            reactions_resp = await client.get(
+                post_url,
+                params={
+                    "fields": "reactions.summary(true)",
+                    "access_token": page_access_token
+                }
+            )
+            reactions_data = reactions_resp.json() if reactions_resp.status_code == 200 else {}
+            total_reactions = reactions_data.get("reactions", {}).get("summary", {}).get("total_count", 0)
+
+            return {
+                "post_id": post_id,
+                "message": meta_data.get("message") or meta_data.get("story", ""),
+                "created_time": meta_data.get("created_time"),
+                "permalink_url": meta_data.get("permalink_url"),
+                "full_picture": meta_data.get("full_picture"),
+                "shares_count": meta_data.get("shares", {}).get("count", 0),
+                "comments_count": meta_data.get("comments", {}).get("summary", {}).get("total_count", 0),
+                "reactions_count": total_reactions,
+                "reactions": {}
+            }
+    except httpx.RequestError as exc:
+        raise HTTPException(status_code=500, detail=f"Không thể kết nối tới Facebook Graph API: {str(exc)}")

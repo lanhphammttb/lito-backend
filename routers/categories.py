@@ -84,7 +84,7 @@ async def create_category(
             name=payload.name,
             description=payload.description,
             parent_id=payload.parent_id,
-            display_order=getattr(payload, 'sort_order', None) or 0,
+            display_order=payload.display_order,
             created_at=datetime.utcnow(),
         )
         session.add(row)
@@ -114,13 +114,17 @@ async def update_category(
             parent = session.get(CategoryTable, payload.parent_id)
             if not parent:
                 raise HTTPException(status_code=400, detail="Parent category không tồn tại")
+            visited = {category_id}
+            while parent:
+                if parent.id in visited:
+                    raise HTTPException(status_code=400, detail="Danh mục cha tạo vòng lặp")
+                visited.add(parent.id)
+                parent = session.get(CategoryTable, parent.parent_id) if parent.parent_id else None
                 
         row.name = payload.name
-        row.slug = payload.slug
         row.description = payload.description
         row.parent_id = payload.parent_id
-        row.image_url = payload.image_url
-        row.display_order = payload.sort_order or row.display_order
+        row.display_order = payload.display_order
         
         session.add(row)
         session.commit()

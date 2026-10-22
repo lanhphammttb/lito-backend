@@ -210,7 +210,14 @@ async def create_product_image(payload: dict, user: User = Depends(get_current_u
 @router.get("/{product_id}/history")
 async def get_product_history(product_id: int, user: User = Depends(get_current_user)):
     """Get product history."""
-    return {"price_changes": [], "lifecycle": []}
+    from services.product import find_product
+    from models.product import PriceChangeTable, LifecycleEventTable
+    find_product(product_id)
+    with Session(engine) as session:
+        return {
+            "price_changes": [r.model_dump() for r in session.exec(select(PriceChangeTable).where(PriceChangeTable.product_id == product_id).order_by(PriceChangeTable.changed_at.desc())).all()],
+            "lifecycle": [r.model_dump() for r in session.exec(select(LifecycleEventTable).where(LifecycleEventTable.product_id == product_id).order_by(LifecycleEventTable.changed_at.desc())).all()],
+        }
 
 
 @router.get("/variants")

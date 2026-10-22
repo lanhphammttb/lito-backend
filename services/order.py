@@ -8,8 +8,6 @@ from services.product import find_product, compute_product_cost
 from services.stock_ledger import (
     calculate_material_requirements,
     validate_material_availability,
-    reserve_materials_for_order,
-    release_reserved_materials_for_order,
     consume_reserved_materials_for_order,
     has_consumed_materials_for_order,
 )
@@ -194,13 +192,16 @@ def ensure_materials_available(order):
 
 
 def reserve_stock_for_order(order, current_user):
-    """Reserve materials without consuming on-hand stock."""
-    reserve_materials_for_order(order, current_user)
+    """Material choice belongs to each job; confirming an order does not reserve BOM."""
+    return
 
 
 def release_reserved_stock_for_order(order, current_user):
     """Release reservation if production has not consumed it yet."""
-    release_reserved_materials_for_order(order, current_user)
+    from services.stock_ledger import release_legacy_order_reservations
+    if has_consumed_materials_for_order(order.id):
+        raise HTTPException(409, "Đơn đã tiêu hao nguyên liệu, không thể hoàn giữ chỗ tự động")
+    release_legacy_order_reservations(order.id, current_user.id)
 
 
 def deduct_stock_for_order(order, current_user):
@@ -215,4 +216,6 @@ def restock_for_order(order, current_user):
             status_code=409,
             detail="Đơn đã bắt đầu sản xuất, không thể hoàn kho tự động",
         )
+    from services.stock_ledger import cancel_unstarted_order_jobs
+    cancel_unstarted_order_jobs(order.id, current_user.id)
     release_reserved_stock_for_order(order, current_user)

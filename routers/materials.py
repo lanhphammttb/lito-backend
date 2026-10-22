@@ -3,6 +3,7 @@ from typing import List, Optional
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlmodel import Session
+from sqlalchemy.exc import IntegrityError
 
 from config.database import engine, upsert_mongo, delete_mongo
 from models.user import User
@@ -19,6 +20,12 @@ router = APIRouter()
 # In-memory data stores
 materials: List[Material] = []
 stock_movements: List[StockMovement] = []
+
+
+def _unit_type_for(unit: str, session: Session):
+    from routers.catalog import CatalogEntry, DEFAULTS
+    entry = session.get(CatalogEntry, ("units", unit))
+    return entry.unit_type if entry else dict(DEFAULTS["units"]).get(unit)
 
 
 @router.get("")
@@ -98,6 +105,7 @@ async def create_material(
     )
 
     with Session(engine) as session:
+        material.unit_type = _unit_type_for(material.unit, session) or material.unit_type
         row = MaterialTable(
             code=material.code,
             name=material.name,
@@ -116,7 +124,11 @@ async def create_material(
             created_at=material.created_at,
         )
         session.add(row)
-        session.commit()
+        try:
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+            raise HTTPException(409, "Mã nguyên liệu đã tồn tại")
         session.refresh(row)
 
     material.id = row.id
@@ -144,13 +156,52 @@ async def update_material(
     material.type = payload.type
     material.unit = payload.unit
     material.unit_type = getattr(payload, "unit_type", None) or getattr(material, "unit_type", "continuous")
+    material.base_unit = payload.base_unit or payload.unit
+    fields = payload.model_fields_set
+    new_stock = (payload.on_hand_qty if payload.on_hand_qty is not None else payload.stock_quantity) if fields & {"on_hand_qty", "stock_quantity"} else material.on_hand_qty
+    if new_stock < material.reserved_qty:
+        raise HTTPException(status_code=409, detail="Tồn thực tế không thể nhỏ hơn lượng đang giữ chỗ")
+    delta = new_stock - material.on_hand_qty
+    material.stock_quantity = material.on_hand_qty = new_stock
+    material.available_qty = new_stock - material.reserved_qty
     if payload.unit_price is not None:
         material.unit_price = payload.unit_price
     material.low_threshold = payload.low_threshold
     material.supplier_id = payload.supplier_id
     material.note = payload.note
 
-    save_material_sql(material)
+    # Persist the edited balance and its audit movement in one transaction.
+    with Session(engine) as session:
+        from sqlmodel import select
+        row = session.exec(select(MaterialTable).where(MaterialTable.id == material_id).with_for_update()).first()
+        if not row:
+            raise HTTPException(404, "Nguyên liệu không tồn tại")
+        material.unit_type = _unit_type_for(material.unit, session) or material.unit_type
+        old_stock = row.on_hand_qty if row.on_hand_qty is not None else row.stock_quantity
+        if old_stock == 0 and row.stock_quantity > 0:
+            old_stock = row.stock_quantity
+        if not fields & {"on_hand_qty", "stock_quantity"}:
+            new_stock = old_stock
+        if new_stock < row.reserved_qty:
+            raise HTTPException(409, "Tồn thực tế không thể nhỏ hơn lượng đang giữ chỗ")
+        if (material.unit != row.unit or material.unit_type != row.unit_type) and row.reserved_qty:
+            raise HTTPException(409, "Không đổi đơn vị khi nguyên liệu đang được giữ chỗ")
+        delta = new_stock - old_stock
+        material.reserved_qty = row.reserved_qty
+        material.stock_quantity = material.on_hand_qty = new_stock
+        material.available_qty = new_stock - row.reserved_qty
+        for key in ("code", "name", "type", "unit", "unit_type", "base_unit", "unit_price", "stock_quantity", "on_hand_qty", "available_qty", "low_threshold", "supplier_id", "note"):
+            setattr(row, key, getattr(material, key))
+        session.add(row)
+        if delta:
+            session.add(StockMovementTable(material_id=material_id, quantity_change=delta,
+                movement_type="adjustment", user_id=user.id, note="Sửa tồn kho trong thông tin nguyên liệu"))
+        try:
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+            raise HTTPException(409, "Mã nguyên liệu đã tồn tại")
+    upsert_mongo("materials", material.model_dump(mode="json"))
 
     log_activity(user.id, "material", material_id, "update", {"name": material.name})
     await create_audit_log(user, "UPDATE", "materials", material_id, before_data, material.__dict__, request)
@@ -199,7 +250,11 @@ async def add_stock_movement(
     created_at = datetime.utcnow()
 
     # Update material stock
-    material.stock_quantity += payload.quantity_change
+    new_quantity = material.on_hand_qty + payload.quantity_change
+    if new_quantity < material.reserved_qty:
+        raise HTTPException(409, "Tồn thực tế không thể nhỏ hơn lượng giữ chỗ")
+    material.stock_quantity = material.on_hand_qty = new_quantity
+    material.available_qty = new_quantity - material.reserved_qty
     save_material_sql(material)
 
     # Save movement to SQL and use DB-generated ID

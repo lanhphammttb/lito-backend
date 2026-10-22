@@ -12,6 +12,12 @@ class ProductionMaterial(BaseModel):
     reserved_quantity: float = 0
     actual_quantity: float = 0
     wastage_percent: float = 0
+    quantity_per_product: Optional[float] = None
+    product_wastage_percent: float = 0
+    material_name: Optional[str] = None
+    unit: Optional[str] = None
+    unit_type: Optional[str] = None
+    unit_price: Optional[float] = None
 
 
 class ProductionJob(BaseModel):

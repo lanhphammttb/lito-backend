@@ -130,9 +130,7 @@ def save_material_sql(material):
     if on_hand_qty is None:
         on_hand_qty = material.stock_quantity
     reserved_qty = getattr(material, "reserved_qty", 0) or 0
-    available_qty = getattr(material, "available_qty", None)
-    if available_qty is None:
-        available_qty = max(0.0, float(on_hand_qty) - float(reserved_qty))
+    available_qty = max(0.0, float(on_hand_qty) - float(reserved_qty))
     base_unit = getattr(material, "base_unit", None) or getattr(material, "unit", None)
 
     unit_type = getattr(material, "unit_type", None) or "continuous"
@@ -170,7 +168,7 @@ def save_material_sql(material):
     # Mongo dual-write
     upsert_mongo("materials", {
         "id": material.id, "code": material.code, "name": material.name,
-        "type": material.type, "unit": material.unit, "unit_price": material.unit_price,
+        "type": material.type, "unit": material.unit, "unit_type": unit_type, "unit_price": material.unit_price,
         "stock_quantity": material.stock_quantity, "on_hand_qty": on_hand_qty,
         "reserved_qty": reserved_qty, "available_qty": available_qty,
         "base_unit": base_unit, "low_threshold": material.low_threshold,

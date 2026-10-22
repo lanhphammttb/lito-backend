@@ -10,9 +10,10 @@ from utils.datetime import utcnow
 class MaterialUsage(BaseModel):
     """Material usage in a product."""
     material_id: int
-    quantity: float
-    wastage_percent: float = 0
+    quantity: float = Field(gt=0, allow_inf_nan=False)
+    wastage_percent: float = Field(default=0, ge=0, le=100, allow_inf_nan=False)
     usage_unit: Optional[str] = None
+    alternative_material_ids: List[int] = Field(default_factory=list)
 
 
 class Product(BaseModel):
@@ -39,6 +40,8 @@ class Product(BaseModel):
     demand_score: float = 0
     feasibility_score: float = 0
     finished_qty: int = 0
+    facebook_post_id: Optional[str] = None
+    instagram_post_id: Optional[str] = None
     created_by: Optional[int] = None
     updated_by: Optional[int] = None
     created_at: datetime = Field(default_factory=utcnow)
@@ -70,6 +73,8 @@ class ProductTable(SQLModel, table=True):
     demand_score: float = 0
     feasibility_score: float = 0
     finished_qty: int = 0
+    facebook_post_id: Optional[str] = SQLField(default=None)
+    instagram_post_id: Optional[str] = SQLField(default=None)
     created_by: Optional[int] = None
     updated_by: Optional[int] = None
     created_at: datetime = SQLField(default_factory=utcnow)

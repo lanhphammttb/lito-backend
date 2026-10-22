@@ -17,6 +17,7 @@ from routers.ai import router as ai_router
 from routers.auth import router as auth_router
 from routers.cashflow_router import router as cashflow_router
 from routers.categories import router as categories_router
+from routers.catalog import router as catalog_router
 from routers.content import router as content_router
 from routers.customers import router as customers_router
 from routers.dashboard import router as dashboard_router
@@ -46,6 +47,7 @@ from routers.system import router as system_router, websocket_endpoint
 from routers.tasks import router as tasks_router
 from routers.upload import router as upload_router
 from routers.ga4_router import router as ga4_router
+from routers.social import router as social_router
 
 
 APP_TITLE = "LITO Handmade Business OS"
@@ -95,6 +97,7 @@ def include_routers(app: FastAPI) -> None:
     app.include_router(activity_router, prefix="/activity", tags=["Activity"])
     app.include_router(tasks_router, prefix="/tasks", tags=["Tasks"])
     app.include_router(categories_router, prefix="/categories", tags=["Categories"])
+    app.include_router(catalog_router, prefix="/catalog", tags=["Catalog"])
     app.include_router(production_router, prefix="/production-jobs", tags=["Production"])
     app.include_router(expenses_router, prefix="/expenses", tags=["Expenses"])
     app.include_router(cashflow_router, prefix="/cashflow", tags=["CashFlow"])
@@ -103,6 +106,7 @@ def include_routers(app: FastAPI) -> None:
     app.include_router(audit_router, prefix="/audit", tags=["Audit"])
     app.include_router(marketplace_router, prefix="/marketplace", tags=["Marketplace"])
     app.include_router(notifications_router, prefix="/notifications", tags=["Notifications"])
+    app.include_router(social_router, tags=["Social"])
     app.include_router(system_router, prefix="/system", tags=["System"])
     app.include_router(system_router, tags=["System Compatibility"])
     app.add_api_websocket_route("/ws", websocket_endpoint)

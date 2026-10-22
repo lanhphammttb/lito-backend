@@ -1,4 +1,5 @@
 import os
+import base64
 from fastapi import APIRouter, File, UploadFile, HTTPException, Depends
 from pydantic import BaseModel
 from models.user import User
@@ -37,17 +38,20 @@ async def upload_image(
     user: User = Depends(get_current_user),
 ):
     require_admin(user)
-    if cloudinary is None:
-        raise HTTPException(
-            status_code=503,
-            detail='Cloudinary is not configured. Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, and CLOUDINARY_API_SECRET.',
-        )
-
-    if not file.content_type.startswith('image/'):
+    if file.content_type not in {'image/jpeg', 'image/png', 'image/webp', 'image/gif'}:
         raise HTTPException(status_code=400, detail='File provided is not an image.')
 
+    contents = await file.read(5 * 1024 * 1024 + 1)
+    if not contents or len(contents) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail='Ảnh phải có dung lượng từ 1 byte đến 5 MB')
+    if cloudinary is None:
+        # The image URL is saved with the product in SQL, including on serverless.
+        # No ephemeral disk files or separate storage configuration are required.
+        if len(contents) > 2 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail='Ảnh tối đa 2 MB khi chưa cấu hình Cloudinary')
+        return UploadResponse(url=f'data:{file.content_type};base64,{base64.b64encode(contents).decode()}', public_id='')
+
     try:
-        contents = await file.read()
         result = cloudinary.uploader.upload(contents, folder='hala_handmade')
         return UploadResponse(url=result.get('secure_url'), public_id=result.get('public_id'))
     except Exception as e:

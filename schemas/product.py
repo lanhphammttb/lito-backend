@@ -23,6 +23,7 @@ class ProductBase(BaseModel):
     marketing_cost: float = 0
     platform_fee_percent: float = 0
     cost_breakdown: Optional[Dict[str, float]] = None
+    facebook_post_id: Optional[str] = None
 
 
 class ProductCreate(ProductBase):
@@ -32,7 +33,7 @@ class ProductCreate(ProductBase):
 
 class ProductVariantCreate(BaseModel):
     """Product variant create schema."""
-    product_id: int
+    product_id: Optional[int] = None
     name: str
     sku: Optional[str] = None
     price_modifier: float = 0
@@ -50,11 +51,12 @@ class ProductBundleCreate(BaseModel):
 
 class ProductImageCreate(BaseModel):
     """Product image create schema."""
-    product_id: int
+    product_id: Optional[int] = None
     url: str
     type: str = "image"
     display_order: int = 0
     is_primary: bool = False
+    is_public: bool = True
 
 
 class ProductReviewCreate(BaseModel):

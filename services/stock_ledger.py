@@ -11,6 +11,7 @@ from config.database import engine
 from models.material import StockMovement, StockMovementTable, MaterialBatchTable
 from services.material import find_material, persist_stock_movement, save_material_sql
 from services.product import find_product
+from utils.quantities import effective_quantity
 
 
 def _material_state(material_id: int):
@@ -94,12 +95,8 @@ def calculate_product_material_requirements(product, quantity: float) -> Dict[in
     product_wastage = getattr(product, "wastage_percent", 0) or 0
     for usage in product.materials:
         usage_wastage = getattr(usage, "wastage_percent", 0) or 0
-        total_wastage = max(0.0, product_wastage + usage_wastage)
-        qty_per_unit = float(usage.quantity) * (1 + total_wastage / 100)
-        # Round up for piece-type materials so we never request 0.5 eyes
         material = find_material(usage.material_id)
-        if getattr(material, "unit_type", "continuous") == "piece":
-            qty_per_unit = math.ceil(qty_per_unit)
+        qty_per_unit = effective_quantity(usage.quantity, product_wastage, usage_wastage, material.unit_type)
         requirements[usage.material_id] += qty_per_unit * float(quantity)
     return {material_id: round(total, 4) for material_id, total in requirements.items()}
 
@@ -276,11 +273,14 @@ def record_purchase(material_id: int, quantity: float, user_id: int, reference_i
     )
     persist_stock_movement(movement)
     _sync_material_snapshot(material.id, on_hand + quantity, reserved)
+    return movement
 
 
 def apply_adjustment(material_id: int, quantity_change: float, user_id: int, note: str | None = None):
     """Apply a direct stock adjustment to on-hand inventory."""
     material, on_hand, reserved, _ = _material_state(material_id)
+    if not math.isfinite(quantity_change) or on_hand + quantity_change < reserved:
+        raise HTTPException(status_code=409, detail="Tồn thực tế không thể âm hoặc nhỏ hơn lượng giữ chỗ")
     movement = StockMovement(
         id=0,
         material_id=material_id,
@@ -292,9 +292,72 @@ def apply_adjustment(material_id: int, quantity_change: float, user_id: int, not
     )
     persist_stock_movement(movement)
     _sync_material_snapshot(material.id, on_hand + quantity_change, reserved)
+    from services.product import clear_product_cost_cache
+    clear_product_cost_cache()
+    return movement
 
 
 # ── Make-to-stock (MTS) job helpers ──────────────────────────────────────────
+
+def release_legacy_order_reservations(order_id: int, user_id: int):
+    """Release unconsumed legacy BOM holds when moving an order to job planning."""
+    from models.material import MaterialTable
+    with Session(engine) as session:
+        movements = session.exec(select(StockMovementTable).where(
+            StockMovementTable.reference_type == "order", StockMovementTable.reference_id == order_id)).all()
+        balances = defaultdict(float)
+        for m in movements:
+            if m.movement_type == "reserve":
+                balances[m.material_id] += m.quantity_change
+            elif m.movement_type in {"consume", "release"}:
+                balances[m.material_id] -= abs(m.quantity_change)
+        for mid, balance in sorted(balances.items()):
+            if balance <= 0:
+                continue
+            mat = session.exec(select(MaterialTable).where(MaterialTable.id == mid).with_for_update()).first()
+            if not mat:
+                continue
+            released = min(balance, mat.reserved_qty)
+            mat.reserved_qty -= released
+            mat.available_qty = max(0, mat.on_hand_qty - mat.reserved_qty)
+            session.add(mat)
+            session.add(StockMovementTable(material_id=mid, quantity_change=-released, movement_type="release",
+                reference_type="order", reference_id=order_id, user_id=user_id, note="Chuyển sang chọn nguyên liệu theo job"))
+        session.commit()
+
+
+def cancel_unstarted_order_jobs(order_id: int, user_id: int):
+    """Cancelling an order also releases the holds belonging to its jobs."""
+    import json
+    from models.production import ProductionJobTable
+    from models.material import MaterialTable
+    with Session(engine) as session:
+        jobs = session.exec(select(ProductionJobTable).where(ProductionJobTable.order_id == order_id)
+            .order_by(ProductionJobTable.id).with_for_update()).all()
+        if any(j.status in {"in_progress", "paused", "completed"} for j in jobs):
+            raise HTTPException(409, "Đơn có job đã sử dụng nguyên liệu; cần xử lý kho trước khi hủy")
+        for job in jobs:
+            if job.status == "cancelled":
+                continue
+            materials = json.loads(job.materials_json or "[]")
+            for usage in sorted(materials, key=lambda m: m["material_id"]):
+                own = usage.get("reserved_quantity", 0)
+                if own <= 0:
+                    continue
+                mat = session.exec(select(MaterialTable).where(MaterialTable.id == usage["material_id"]).with_for_update()).first()
+                if not mat:
+                    raise HTTPException(409, "Nguyên liệu giữ chỗ không còn tồn tại")
+                mat.reserved_qty = max(0, mat.reserved_qty - own)
+                mat.available_qty = max(0, mat.on_hand_qty - mat.reserved_qty)
+                usage["reserved_quantity"] = 0
+                session.add(mat)
+                session.add(StockMovementTable(material_id=mat.id, quantity_change=-own, movement_type="release",
+                    reference_type="production_job", reference_id=job.id, user_id=user_id, note=f"Hủy đơn #{order_id}"))
+            job.materials_json = json.dumps(materials)
+            job.status = "cancelled"
+            job.updated_at = datetime.utcnow()
+            session.add(job)
+        session.commit()
 
 def reserve_materials_for_job(job, requirements: Dict[int, float], current_user):
     """Reserve materials for a standalone (no-order) production job."""

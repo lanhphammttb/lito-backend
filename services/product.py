@@ -3,6 +3,7 @@ from typing import Dict, List, Optional
 from fastapi import HTTPException
 
 from config.settings import settings
+from utils.quantities import effective_quantity
 
 # In-memory cache for product costs
 _product_cost_cache: Dict[int, Dict[str, float]] = {}
@@ -87,6 +88,8 @@ def find_product(product_id: int):
             demand_score=row.demand_score or 0,
             feasibility_score=row.feasibility_score or 0,
             finished_qty=getattr(row, "finished_qty", 0) or 0,
+            facebook_post_id=getattr(row, "facebook_post_id", None),
+            instagram_post_id=getattr(row, "instagram_post_id", None),
             created_by=row.created_by,
             updated_by=row.updated_by,
             materials=mat_usages, created_at=row.created_at, updated_at=row.updated_at,
@@ -130,7 +133,7 @@ def compute_product_cost(product) -> Dict[str, float]:
         material = find_material_internal(usage.material_id)
         if material:
             wastage_percent = (getattr(product, "wastage_percent", 0) or 0) + (getattr(usage, "wastage_percent", 0) or 0)
-            material_cost += material.unit_price * usage.quantity * (1 + max(0.0, wastage_percent) / 100)
+            material_cost += material.unit_price * effective_quantity(usage.quantity, wastage_percent, unit_type=material.unit_type)
 
     labor_cost = (product.time_minutes / 60) * settings.hourly_rate
     packaging_cost = getattr(product, "packaging_cost", 0) or 0
@@ -187,20 +190,20 @@ def compute_product_cost(product) -> Dict[str, float]:
         material = find_material_internal(usage.material_id)
         if material and usage.quantity > 0:
             wastage_percent = (getattr(product, "wastage_percent", 0) or 0) + (getattr(usage, "wastage_percent", 0) or 0)
-            effective_qty = usage.quantity * (1 + max(0.0, wastage_percent) / 100)
-            capacities.append((material.stock_quantity or 0) // effective_qty)
+            effective_qty = effective_quantity(usage.quantity, wastage_percent, unit_type=material.unit_type)
+            capacities.append((material.available_qty or 0) // effective_qty)
     max_units = int(min(capacities)) if capacities else None
 
     shortage_materials = []
     for usage in product.materials:
         material = find_material_internal(usage.material_id)
         wastage_percent = (getattr(product, "wastage_percent", 0) or 0) + (getattr(usage, "wastage_percent", 0) or 0)
-        required_qty = usage.quantity * (1 + max(0.0, wastage_percent) / 100)
-        if material and material.stock_quantity < required_qty:
+        required_qty = effective_quantity(usage.quantity, wastage_percent, unit_type=material.unit_type) if material else 0
+        if material and material.available_qty < required_qty:
             shortage_materials.append({
                 "material_id": usage.material_id,
                 "need": required_qty,
-                "have": material.stock_quantity,
+                "have": material.available_qty,
                 "code": material.code,
             })
 

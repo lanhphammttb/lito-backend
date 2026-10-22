@@ -1,12 +1,55 @@
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from sqlmodel import Session, select
 
 from config.database import engine
 from models.user import User
 from models.product import ProductImageTable
 from services.auth import get_current_user, require_admin
+from services.product import find_product
 
 router = APIRouter()
+
+
+class ProductImageCreate(BaseModel):
+    product_id: int
+    url: str
+    type: str = "image"
+    display_order: int = 0
+    is_primary: bool = False
+    is_public: bool = True
+
+
+@router.post('')
+async def create_product_image(payload: ProductImageCreate, current_user: User = Depends(get_current_user)):
+    require_admin(current_user)
+    find_product(payload.product_id)
+    with Session(engine) as session:
+        img = ProductImageTable(**payload.model_dump())
+        session.add(img)
+        session.commit()
+        session.refresh(img)
+        return img
+
+
+class ProductImageUpdate(BaseModel):
+    url: str
+
+
+@router.put('/{image_id}')
+async def update_product_image(image_id: int, payload: ProductImageUpdate, current_user: User = Depends(get_current_user)):
+    require_admin(current_user)
+    if not payload.url.strip():
+        raise HTTPException(422, 'URL ảnh không được để trống')
+    with Session(engine) as session:
+        image = session.get(ProductImageTable, image_id)
+        if not image:
+            raise HTTPException(404, 'Ảnh không tồn tại')
+        image.url = payload.url
+        session.add(image)
+        session.commit()
+        session.refresh(image)
+        return image
 
 @router.put('/{image_id}/set-primary')
 async def set_primary_product_image(image_id: int, current_user: User = Depends(get_current_user)):

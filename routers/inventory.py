@@ -82,26 +82,34 @@ async def inventory_summary(user: User = Depends(get_current_user)):
     Replaces: /materials, /products, /suppliers, /purchase-orders
     """
     # Material statistics
-    low_stock_count = sum(1 for m in _materials if m.stock_quantity <= m.low_threshold)
-    total_value = sum((m.stock_quantity or 0) * (getattr(m, "unit_price", 0) or 0) for m in _materials)
+    from models.material import MaterialTable
+    from models.product import ProductTable
+    from services.material import find_material
+    from services.product import find_product
+    with Session(engine) as session:
+        current_materials = [find_material(mid) for mid in session.exec(select(MaterialTable.id)).all()]
+        current_products = [find_product(pid) for pid in session.exec(select(ProductTable.id)).all()]
+    low_stock_count = sum(1 for m in current_materials if m.available_qty <= m.low_threshold)
+    total_value = sum((m.stock_quantity or 0) * (getattr(m, "unit_price", 0) or 0) for m in current_materials)
 
     # Material types breakdown
     types_breakdown = {}
-    for m in _materials:
+    for m in current_materials:
         types_breakdown[m.type] = types_breakdown.get(m.type, 0) + 1
 
     # Products with max units calculation
-    material_map = {m.id: m for m in _materials}
+    material_map = {m.id: m for m in current_materials}
     enhanced_products = []
-    for p in _products:
+    for p in current_products:
         if not getattr(p, "materials", None):
             max_units = 0
         else:
+            from services.stock_ledger import calculate_product_material_requirements
             min_units = float("inf")
-            for usage in p.materials:
-                mat = material_map.get(usage.material_id)
+            for mid, needed in calculate_product_material_requirements(p, 1).items():
+                mat = material_map.get(mid)
                 if mat:
-                    max_for_mat = (mat.stock_quantity or 0) / (usage.quantity or 1)
+                    max_for_mat = (mat.available_qty or 0) / needed
                     min_units = min(min_units, max_for_mat)
             max_units = int(min_units) if min_units != float("inf") else 0
 
@@ -116,12 +124,12 @@ async def inventory_summary(user: User = Depends(get_current_user)):
     from services.inventory import find_supplier, find_purchase_order
 
     return {
-        "materials": [dict(m) for m in _materials],
+        "materials": [m.model_dump() for m in current_materials],
         "products": enhanced_products,
         "suppliers": [find_supplier(s.id).model_dump() for s in all_suppliers],
         "purchase_orders": [find_purchase_order(p.id).model_dump() for p in all_pos],
         "statistics": {
-            "total_materials": len(_materials),
+            "total_materials": len(current_materials),
             "low_stock_count": low_stock_count,
             "total_inventory_value": round(total_value, 2),
             "types_breakdown": types_breakdown,

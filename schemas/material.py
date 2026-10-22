@@ -32,10 +32,10 @@ class MaterialCreate(BaseModel):
             raise ValueError('Đơn giá không được âm')
         return v
 
-    @field_validator('stock_quantity')
+    @field_validator('stock_quantity', 'on_hand_qty')
     @classmethod
     def stock_non_negative(cls, v: float) -> float:
-        if v < 0:
+        if v is not None and v < 0:
             raise ValueError('Số lượng tồn kho không được âm')
         return v
 

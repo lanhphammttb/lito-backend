@@ -41,7 +41,7 @@ def _call_gemini(prompt: str, model: str) -> str:
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {
                 "temperature": 0.4,
-                "maxOutputTokens": 600,
+                "maxOutputTokens": 4096,
             },
         }
     ).encode("utf-8")
@@ -64,10 +64,13 @@ def _call_gemini(prompt: str, model: str) -> str:
     candidates = data.get("candidates") or []
     if not candidates:
         raise HTTPException(status_code=502, detail="Gemini returned no candidates")
-    parts = candidates[0].get("content", {}).get("parts") or []
+    candidate = candidates[0]
+    parts = candidate.get("content", {}).get("parts") or []
     text = "\n".join(part.get("text", "") for part in parts if part.get("text")).strip()
     if not text:
         raise HTTPException(status_code=502, detail="Gemini returned an empty response")
+    if candidate.get("finishReason") == "MAX_TOKENS":
+        raise HTTPException(status_code=502, detail="Gemini response was truncated by maxOutputTokens")
     return text
 
 
