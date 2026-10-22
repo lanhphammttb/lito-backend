@@ -1,6 +1,8 @@
 """Google Analytics 4 Data API router — server-side, service account auth."""
 import json
+import logging
 import os
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -15,25 +17,69 @@ try:
         DateRange, Dimension, Metric, RunReportRequest, RunRealtimeReportRequest,
     )
     from google.oauth2 import service_account
+    from google.api_core.exceptions import PermissionDenied, Unauthenticated
 except ModuleNotFoundError:
     BetaAnalyticsDataClient = None
     DateRange = Dimension = Metric = RunReportRequest = RunRealtimeReportRequest = None
     service_account = None
+    PermissionDenied = Unauthenticated = None
 
 router = APIRouter(prefix="/ga4", tags=["GA4 Analytics"])
 
-_CREDENTIALS_PATH = os.path.join(os.path.dirname(__file__), "../config/ga4_credentials.json")
-_PROPERTY_ID = "properties/536976944"
+_CREDENTIALS_PATH = Path(__file__).resolve().parents[1] / "config" / "ga4_credentials.json"
+logger = logging.getLogger(__name__)
+
+
+def _property_name() -> str:
+    property_id = os.getenv("GA4_PROPERTY_ID", "536976944").strip().removeprefix("properties/")
+    if not property_id.isdigit():
+        raise HTTPException(503, "GA4_PROPERTY_ID phải là ID số của GA4 property.")
+    return f"properties/{property_id}"
 
 
 def _client() -> BetaAnalyticsDataClient:
     if BetaAnalyticsDataClient is None or service_account is None:
         raise HTTPException(503, "GA4 dependencies are not installed. Install google-analytics-data.")
-    creds = service_account.Credentials.from_service_account_file(
-        _CREDENTIALS_PATH,
-        scopes=["https://www.googleapis.com/auth/analytics.readonly"],
-    )
+    _property_name()
+    raw_credentials = os.getenv("GA4_CREDENTIALS_JSON", "").strip()
+    credentials_path = Path(os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or _CREDENTIALS_PATH)
+    try:
+        if raw_credentials:
+            info = json.loads(raw_credentials)
+        elif credentials_path.is_file():
+            info = json.loads(credentials_path.read_text(encoding="utf-8"))
+        else:
+            raise HTTPException(
+                503,
+                "Chưa cấu hình kết nối GA4. Thêm GA4_CREDENTIALS_JSON (JSON service account) "
+                "vào biến môi trường backend trên Vercel rồi deploy lại; cấp quyền Viewer "
+                "cho service account trong GA4 property.",
+            )
+        if not isinstance(info, dict) or info.get("type") != "service_account":
+            raise ValueError("Expected service account credentials")
+        creds = service_account.Credentials.from_service_account_info(
+            info, scopes=["https://www.googleapis.com/auth/analytics.readonly"],
+        )
+    except (OSError, ValueError, TypeError):
+        raise HTTPException(
+            503, "Credentials GA4 không hợp lệ. Kiểm tra JSON service account trong "
+            "GA4_CREDENTIALS_JSON hoặc file GOOGLE_APPLICATION_CREDENTIALS.",
+        ) from None
     return BetaAnalyticsDataClient(credentials=creds)
+
+
+def _report_error(error: Exception) -> HTTPException:
+    if isinstance(error, HTTPException):
+        return error
+    logger.warning("GA4 request failed (%s)", type(error).__name__)
+    if PermissionDenied is not None and isinstance(error, PermissionDenied):
+        return HTTPException(
+            403, "GA4 từ chối quyền truy cập. Kiểm tra GA4_PROPERTY_ID, cấp quyền Viewer "
+            "cho service account trong property và bật Google Analytics Data API.",
+        )
+    if Unauthenticated is not None and isinstance(error, Unauthenticated):
+        return HTTPException(503, "GA4 không xác thực được service account. Kiểm tra credentials backend.")
+    return HTTPException(502, "Không thể kết nối Google Analytics lúc này. Vui lòng thử lại sau.")
 
 
 def _rows_to_list(response, dim_keys: list[str], metric_keys: list[str]) -> list[dict]:
@@ -56,7 +102,7 @@ def _pct_change(current: float, previous: float) -> float | None:
 
 def _fetch_overview(client, start, end, prev_start, prev_end):
     req = RunReportRequest(
-        property=_PROPERTY_ID,
+        property=_property_name(),
         date_ranges=[
             DateRange(start_date=str(start), end_date=str(end)),
             DateRange(start_date=str(prev_start), end_date=str(prev_end)),
@@ -100,7 +146,7 @@ def _fetch_overview(client, start, end, prev_start, prev_end):
 
 def _fetch_sessions_by_day(client, start, end):
     req = RunReportRequest(
-        property=_PROPERTY_ID,
+        property=_property_name(),
         date_ranges=[DateRange(start_date=str(start), end_date=str(end))],
         dimensions=[Dimension(name="date")],
         metrics=[Metric(name="sessions"), Metric(name="totalUsers")],
@@ -111,7 +157,7 @@ def _fetch_sessions_by_day(client, start, end):
 
 def _fetch_top_pages(client, start, end):
     req = RunReportRequest(
-        property=_PROPERTY_ID,
+        property=_property_name(),
         date_ranges=[DateRange(start_date=str(start), end_date=str(end))],
         dimensions=[Dimension(name="pagePath"), Dimension(name="pageTitle")],
         metrics=[Metric(name="screenPageViews"), Metric(name="totalUsers")],
@@ -123,7 +169,7 @@ def _fetch_top_pages(client, start, end):
 
 def _fetch_sources(client, start, end):
     req = RunReportRequest(
-        property=_PROPERTY_ID,
+        property=_property_name(),
         date_ranges=[DateRange(start_date=str(start), end_date=str(end))],
         dimensions=[Dimension(name="sessionSource"), Dimension(name="sessionMedium")],
         metrics=[Metric(name="sessions"), Metric(name="totalUsers")],
@@ -135,7 +181,7 @@ def _fetch_sources(client, start, end):
 
 def _fetch_devices(client, start, end):
     req = RunReportRequest(
-        property=_PROPERTY_ID,
+        property=_property_name(),
         date_ranges=[DateRange(start_date=str(start), end_date=str(end))],
         dimensions=[Dimension(name="deviceCategory")],
         metrics=[Metric(name="sessions"), Metric(name="totalUsers")],
@@ -145,7 +191,7 @@ def _fetch_devices(client, start, end):
 
 def _fetch_countries(client, start, end):
     req = RunReportRequest(
-        property=_PROPERTY_ID,
+        property=_property_name(),
         date_ranges=[DateRange(start_date=str(start), end_date=str(end))],
         dimensions=[Dimension(name="country")],
         metrics=[Metric(name="sessions"), Metric(name="totalUsers")],
@@ -157,7 +203,7 @@ def _fetch_countries(client, start, end):
 
 def _fetch_new_vs_returning(client, start, end):
     req = RunReportRequest(
-        property=_PROPERTY_ID,
+        property=_property_name(),
         date_ranges=[DateRange(start_date=str(start), end_date=str(end))],
         dimensions=[Dimension(name="newVsReturning")],
         metrics=[Metric(name="sessions"), Metric(name="totalUsers")],
@@ -167,7 +213,7 @@ def _fetch_new_vs_returning(client, start, end):
 
 def _fetch_hourly(client, start, end):
     req = RunReportRequest(
-        property=_PROPERTY_ID,
+        property=_property_name(),
         date_ranges=[DateRange(start_date=str(start), end_date=str(end))],
         dimensions=[Dimension(name="hour")],
         metrics=[Metric(name="sessions")],
@@ -179,7 +225,7 @@ def _fetch_hourly(client, start, end):
 
 def _fetch_landing_pages(client, start, end):
     req = RunReportRequest(
-        property=_PROPERTY_ID,
+        property=_property_name(),
         date_ranges=[DateRange(start_date=str(start), end_date=str(end))],
         dimensions=[Dimension(name="landingPage")],
         metrics=[Metric(name="sessions"), Metric(name="totalUsers"), Metric(name="bounceRate")],
@@ -191,7 +237,7 @@ def _fetch_landing_pages(client, start, end):
 
 def _fetch_events(client, start, end):
     req = RunReportRequest(
-        property=_PROPERTY_ID,
+        property=_property_name(),
         date_ranges=[DateRange(start_date=str(start), end_date=str(end))],
         dimensions=[Dimension(name="eventName")],
         metrics=[Metric(name="eventCount"), Metric(name="totalUsers")],
@@ -254,7 +300,7 @@ def _fetch_orders_by_channel(start: date, end: date) -> list[dict]:
 
 
 @router.get("/dashboard")
-def ga4_dashboard(days: int = Query(30, ge=1, le=365)):
+def ga4_dashboard(days: int = Query(30, ge=1, le=365), user: User = Depends(get_current_user)):
     """Single endpoint — fetches all GA4 data in parallel and returns one payload."""
     try:
         client = _client()
@@ -286,7 +332,7 @@ def ga4_dashboard(days: int = Query(30, ge=1, le=365)):
         results["days"] = days
         return results
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise _report_error(e) from None
 
 
 @router.get("/correlation")
@@ -324,7 +370,7 @@ def ga4_correlation(days: int = Query(30, ge=1, le=365), user: User = Depends(ge
             "by_channel": orders_by_channel,
         }
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise _report_error(e) from None
 
 
 @router.get("/ai-context")
@@ -359,19 +405,19 @@ def ga4_ai_context(days: int = Query(30, ge=1, le=365), user: User = Depends(get
             "order_channels": top_channels,
         }
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise _report_error(e) from None
 
 
 @router.get("/realtime")
-def ga4_realtime():
+def ga4_realtime(user: User = Depends(get_current_user)):
     """Active users right now — polled separately every 60s."""
     try:
         client = _client()
         req = RunRealtimeReportRequest(
-            property=_PROPERTY_ID,
+            property=_property_name(),
             metrics=[Metric(name="activeUsers")],
         )
         resp = client.run_realtime_report(req)
         return {"active_users": int(resp.rows[0].metric_values[0].value) if resp.rows else 0}
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        raise _report_error(e) from None

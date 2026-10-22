@@ -112,6 +112,10 @@ class SecurityAndPersistenceTests(unittest.TestCase):
             ("post", "/experiments"),
             ("get", "/strategy/okrs"),
             ("post", "/strategy/okrs"),
+            ("get", "/ga4/dashboard"),
+            ("get", "/ga4/realtime"),
+            ("get", "/ga4/correlation"),
+            ("get", "/ga4/ai-context"),
         ):
             request = getattr(self.client, method)
             response = request(path, json={}) if method == "post" else request(path)
@@ -139,6 +143,80 @@ class SecurityAndPersistenceTests(unittest.TestCase):
         self.assertIsNotNone(okr)
         self.assertEqual(okr["status"], "active")
         self.assertEqual(okr["overall_progress"], 40.0)
+
+    def test_strategy_swot_and_insight_persist_after_creation(self):
+        swot = self.client.post(
+            "/strategy/swot", headers=self.auth_headers,
+            json={"type": "opportunity", "category": "market", "description": "New yarn colors",
+                  "impact": "medium", "action_items": ["Compare suppliers"]},
+        )
+        self.assertEqual(swot.status_code, 200, swot.text)
+        matrix = self.client.get("/strategy/swot", headers=self.auth_headers).json()["matrix"]
+        saved_swot = next(row for row in matrix["opportunities"] if row["id"] == swot.json()["id"])
+        self.assertEqual(saved_swot["action_items"], ["Compare suppliers"])
+        insight = self.client.post(
+            "/strategy/market-insights", headers=self.auth_headers,
+            json={"type": "trend", "title": "Autumn colors", "description": "Seasonal demand",
+                  "source": "Customer survey", "priority": "high"},
+        )
+        self.assertEqual(insight.status_code, 200, insight.text)
+        listing = self.client.get("/strategy/market-insights", headers=self.auth_headers).json()["insights"]
+        saved_insight = next(row for row in listing if row["id"] == insight.json()["id"])
+        self.assertEqual(saved_insight["priority"], "high")
+        self.assertEqual(saved_insight["source"], "Customer survey")
+
+    def test_supplier_create_and_edit_persist_in_summary(self):
+        supplier = self.catalog_request("post", "/inventory/suppliers", {
+            "name": "New supplier", "contact_name": "Supplier contact", "phone": "0123456789",
+            "email": "supplier@example.com", "address": "Test address", "rating": 4,
+            "lead_time_days": 3, "note": "Blue yarn",
+        })
+        summary = self.catalog_request("get", "/inventory/summary")
+        saved = next(row for row in summary["suppliers"] if row["id"] == supplier["id"])
+        self.assertEqual((saved["name"], saved["rating"], saved["lead_time_days"], saved["note"]),
+                         ("New supplier", 4, 3, "Blue yarn"))
+        self.catalog_request("put", f"/inventory/suppliers/{supplier['id']}",
+                             {"name": "Renamed supplier", "lead_time_days": 5, "note": "Pink yarn"})
+        saved = self.catalog_request("get", f"/inventory/suppliers/{supplier['id']}")
+        self.assertEqual((saved["name"], saved["lead_time_days"], saved["note"]),
+                         ("Renamed supplier", 5, "Pink yarn"))
+
+    def test_ga4_missing_and_invalid_credentials_have_actionable_errors(self):
+        from unittest.mock import Mock, patch
+        from routers import ga4_router as ga4
+        missing_file = str(Path(self.temp_dir.name) / "missing-ga4.json")
+        with patch.object(ga4, "BetaAnalyticsDataClient", Mock()), \
+             patch.object(ga4, "service_account", Mock()), \
+             patch.dict(os.environ, {"GA4_CREDENTIALS_JSON": "", "GOOGLE_APPLICATION_CREDENTIALS": missing_file}):
+            for path in ["/ga4/dashboard", "/ga4/realtime", "/ga4/correlation", "/ga4/ai-context"]:
+                response = self.client.get(path, headers=self.auth_headers)
+                self.assertEqual(response.status_code, 503, response.text)
+                self.assertIn("GA4_CREDENTIALS_JSON", response.json()["detail"])
+                self.assertNotIn(missing_file, response.text)
+            os.environ["GA4_CREDENTIALS_JSON"] = "PRIVATE_KEY_SHOULD_NEVER_LEAK"
+            response = self.client.get("/ga4/dashboard", headers=self.auth_headers)
+            self.assertEqual(response.status_code, 503)
+            self.assertNotIn("PRIVATE_KEY_SHOULD_NEVER_LEAK", response.text)
+
+    def test_ga4_accepts_environment_json_and_local_file_credentials(self):
+        import json
+        from unittest.mock import Mock, patch
+        from routers import ga4_router as ga4
+        info = {"type": "service_account", "client_email": "ga4@example.com", "private_key": "fake-test-key"}
+        credentials_file = Path(self.temp_dir.name) / "ga4.json"
+        credentials_file.write_text(json.dumps(info), encoding="utf-8")
+        for raw_json in (json.dumps(info), ""):
+            with patch.object(ga4, "BetaAnalyticsDataClient") as client_factory, \
+                 patch.object(ga4, "service_account", Mock()) as account, \
+                 patch.dict(os.environ, {"GA4_CREDENTIALS_JSON": raw_json,
+                                        "GOOGLE_APPLICATION_CREDENTIALS": str(credentials_file),
+                                        "GA4_PROPERTY_ID": "properties/123456"}):
+                self.assertEqual(ga4._property_name(), "properties/123456")
+                ga4._client()
+                account.Credentials.from_service_account_info.assert_called_once_with(
+                    info, scopes=["https://www.googleapis.com/auth/analytics.readonly"],
+                )
+                client_factory.assert_called_once_with(credentials=account.Credentials.from_service_account_info.return_value)
 
     def test_purchase_order_generate_persists_draft(self):
         response = self.client.post(

@@ -1,4 +1,5 @@
 .env*
+config/ga4_credentials.json
 .venv/
 venv/
 __pycache__/

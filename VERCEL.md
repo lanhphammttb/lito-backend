@@ -14,6 +14,16 @@ Keep `USE_MONGO=false`, `AUTO_INIT_DB_ON_STARTUP=false` and
 `AUTO_SEED_DATA_ON_STARTUP=false`. Configure Cloudinary variables for uploads.
 Do not share the production database with preview deployments.
 
+GA4 requires `GA4_CREDENTIALS_JSON` in the backend's production environment:
+set it to the complete JSON of the GA4 service account, then redeploy. Keep
+private keys out of Git and deployment files. `GA4_PROPERTY_ID` is the numeric
+property ID (defaults to the existing property `536976944`). Enable the Google
+Analytics Data API and grant the service account Viewer access in that GA4
+property. Local development also supports a file selected by
+`GOOGLE_APPLICATION_CREDENTIALS`, or `config/ga4_credentials.json`.
+Missing or invalid credentials return an actionable 503 response; GA4 routes
+require login. Business data and the rest of the app continue to work without GA4.
+
 Initialize the schema explicitly with `config.database.create_db_and_tables()`
 after importing `main` to register every table. Do not seed sample business data.
 For an existing PostgreSQL database, take a backup and restore/copy its data
