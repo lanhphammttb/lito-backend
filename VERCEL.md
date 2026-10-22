@@ -33,7 +33,26 @@ SQLite snapshots for the live database without verifying their freshness.
 
 Set frontend `VITE_API_URL` to the backend deployment URL and
 `VITE_ENABLE_WEBSOCKET=false`, then rebuild the frontend. The notification bell
-already polls HTTP endpoints. Vercel Functions do not host WebSocket servers.
+polls HTTP endpoints. The in-memory WebSocket manager only reaches connections
+on its own instance; it is not a reliable cross-instance notification transport.
+
+Browser notifications use Firebase Cloud Messaging. Set backend Production
+`FIREBASE_CREDENTIALS_JSON` to the complete service account JSON for the same
+Firebase project as the frontend and redeploy. The local file fallback is
+`FIREBASE_CREDENTIALS` or `firebase-adminsdk.json`; deployment must not depend on
+an untracked local file. Keep credentials outside Git. Frontend requires
+`VITE_FIREBASE_API_KEY`, `VITE_FIREBASE_PROJECT_ID`, `VITE_FIREBASE_APP_ID`,
+`VITE_FIREBASE_MESSAGING_SENDER_ID`, and `VITE_FIREBASE_VAPID_KEY`.
+
+Users enable browser notifications explicitly on the Notifications page. A
+granted permission alone is insufficient: the device token must be registered
+with the current user's account. Registration is refreshed after login/reload.
+`GET /notifications/status` checks server configuration and the account's device
+count. `POST /notifications/test` sends only to that account. `/test-email`
+tests SMTP separately. Send results count actual FCM acceptances, report failed
+devices, and remove only definitely expired registrations. FCM acceptance is
+not proof of OS display or of the user reading the message. Check browser and
+OS permissions/Do Not Disturb when validation succeeds but no banner appears.
 
 Production frontend: https://admin.litohandmade.com
 Production backend: https://hala-handmade-api.vercel.app

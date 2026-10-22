@@ -212,6 +212,137 @@ class SecurityAndPersistenceTests(unittest.TestCase):
         response = self.client.post("/ai/analyze", json={"prompt": "hello"})
         self.assertEqual(response.status_code, 401)
 
+    @contextmanager
+    def notification_devices(self):
+        from config.database import engine
+        from models.notifications import FcmTokenTable
+        from sqlmodel import Session, select
+        tokens = ["qa-push-current-a", "qa-push-current-b", "qa-push-other"]
+        with Session(engine) as session:
+            for token, uid in zip(tokens, [self.user_id, self.user_id, 999999]):
+                session.add(FcmTokenTable(token=token, user_id=uid))
+            session.commit()
+        try:
+            yield tokens
+        finally:
+            with Session(engine) as session:
+                for row in session.exec(select(FcmTokenTable).where(FcmTokenTable.token.in_(tokens))):
+                    session.delete(row)
+                session.commit()
+
+    def test_notification_without_receivers_does_not_report_success(self):
+        for path in ["/notifications/status", "/notifications"]:
+            self.assertEqual(self.client.get(path).status_code, 401)
+        for path in ["/notifications/send", "/notifications/test"]:
+            self.assertEqual(self.client.post(path, json={}).status_code, 401)
+        response = self.client.post("/notifications/send", headers=self.auth_headers,
+            json={"title": "No receivers", "body": "Not delivered", "user_ids": [999998]})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertFalse(response.json()["success"])
+        self.assertEqual(response.json()["status"], "no_recipients")
+        self.assertEqual(response.json()["sent_count"], 0)
+
+    def test_notification_counts_actual_acceptances_and_prunes_only_expired_tokens(self):
+        from config.database import engine
+        from models.notifications import FcmTokenTable
+        from legacy_state import NotificationLog
+        from sqlmodel import Session, select
+        with self.notification_devices() as tokens:
+            result = {"attempted": 2, "accepted": 1, "failed": 1,
+                      "invalid_tokens": [tokens[0]], "error_codes": ["UnregisteredError"]}
+            with patch("services.fcm.send_many_result", return_value=result) as transport:
+                response = self.client.post("/notifications/send", headers=self.auth_headers,
+                    json={"title": "Partial delivery", "body": "Only selected account", "data": None,
+                          "user_ids": [self.user_id, self.user_id]})
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(set(transport.call_args.args[0]), set(tokens[:2]))
+            self.assertEqual(transport.call_args.args[3], {})
+            self.assertEqual(response.json()["sent_count"], 1)
+            self.assertEqual(response.json()["status"], "partial")
+            self.assertNotIn(tokens[0], response.text)
+            with Session(engine) as session:
+                remaining = session.exec(select(FcmTokenTable)).all()
+                self.assertNotIn(tokens[0], [row.token for row in remaining])
+                self.assertIn(tokens[1], [row.token for row in remaining])
+                self.assertIn(tokens[2], [row.token for row in remaining])
+                log = session.exec(select(NotificationLog).where(NotificationLog.title == "Partial delivery")).one()
+                self.assertEqual(log.sent_count, 1)
+
+    def test_notification_missing_credentials_does_not_report_success(self):
+        with self.notification_devices(), patch("services.fcm._init", return_value=False), \
+             patch("services.fcm._last_error", "credentials_missing"):
+            response = self.client.post("/notifications/send", headers=self.auth_headers,
+                json={"title": "Disabled push", "body": "No backend credentials", "user_ids": [self.user_id]})
+            self.assertFalse(response.json()["success"])
+            self.assertEqual(response.json()["sent_count"], 0)
+            self.assertEqual(response.json()["failed_devices"], 2)
+            self.assertEqual(response.json()["error_codes"], ["credentials_missing"])
+
+    def test_notification_test_only_targets_current_account(self):
+        with self.notification_devices() as tokens:
+            result = {"attempted": 2, "accepted": 2, "failed": 0, "invalid_tokens": [], "error_codes": []}
+            with patch("services.fcm.send_many_result", return_value=result) as transport, \
+                 patch("routers.notifications.ws_manager.broadcast", new_callable=AsyncMock) as broadcast, \
+                 patch("routers.notifications.ws_manager.send_personal_message", new_callable=AsyncMock, return_value=0):
+                response = self.client.post("/notifications/test", headers=self.auth_headers)
+                broadcast.assert_not_awaited()
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertTrue(response.json()["success"])
+            self.assertEqual(set(transport.call_args.args[0]), set(tokens[:2]))
+
+    def test_notification_rejects_invalid_content_and_recipients(self):
+        for changes in [{"title": " "}, {"body": ""}, {"user_ids": []},
+                        {"user_ids": [True]}, {"user_ids": ["1"]}, {"data": []}]:
+            response = self.client.post("/notifications/send", headers=self.auth_headers,
+                json={"title": "Content validation", "body": "Body", **changes})
+            self.assertEqual(response.status_code, 422, response.text)
+
+    def test_email_test_uses_email_and_reports_failure(self):
+        from config.settings import settings
+        with patch.object(settings, "smtp_host", "smtp.qa.example"), \
+             patch.object(settings, "notification_emails", ["qa@example.com"]), \
+             patch("routers.notifications.send_notifications", return_value=False) as email, \
+             patch("services.fcm.send_many_result") as push:
+            response = self.client.post("/notifications/test-email", headers=self.auth_headers)
+            self.assertEqual(response.status_code, 503)
+            push.assert_not_called()
+            email.assert_called_once()
+            email.return_value = True
+            self.assertEqual(self.client.post("/notifications/test-email", headers=self.auth_headers).status_code, 200)
+
+    def test_fcm_loads_json_credentials_without_file(self):
+        from services import fcm
+        import json
+        fake_info = {"type": "service_account", "project_id": "qa-project"}
+        with patch.object(fcm, "_app", None), patch.object(fcm, "_last_error", None), \
+             patch.object(fcm, "_firebase_available", True), \
+             patch.dict(os.environ, {"FIREBASE_CREDENTIALS_JSON": json.dumps(fake_info)}), \
+             patch.object(fcm.credentials, "Certificate") as certificate, \
+             patch.object(fcm.firebase_admin, "initialize_app", return_value=object()):
+            self.assertTrue(fcm.delivery_status()["push_configured"])
+            certificate.assert_called_once_with(fake_info)
+        with patch.object(fcm, "_app", None), patch.object(fcm, "_last_error", None), \
+             patch.dict(os.environ, {"FIREBASE_CREDENTIALS_JSON": "PRIVATE_VALUE_DO_NOT_LEAK"}):
+            status = fcm.delivery_status()
+            self.assertFalse(status["push_configured"])
+            self.assertEqual(status["configuration_error"], "credentials_invalid")
+            self.assertNotIn("PRIVATE_VALUE_DO_NOT_LEAK", str(status))
+
+    def test_fcm_reports_per_device_failures_without_leaking_tokens(self):
+        from services import fcm
+        from unittest.mock import Mock
+        response = Mock(success_count=1, failure_count=1, responses=[
+            Mock(success=True), Mock(success=False, exception=fcm.messaging.UnregisteredError("expired")),
+        ])
+        with patch.object(fcm, "_init", return_value=True), \
+             patch.object(fcm.messaging, "send_each_for_multicast", return_value=response) as send:
+            result = fcm.send_many_result(["valid-device", "expired-device"], "Title", "Body")
+            self.assertEqual(result["accepted"], 1)
+            self.assertEqual(result["failed"], 1)
+            self.assertEqual(result["invalid_tokens"], ["expired-device"])
+            self.assertEqual(result["error_codes"], ["UnregisteredError"])
+            self.assertTrue(send.call_args.args[0].webpush.fcm_options.link.endswith('/#/notifications'))
+
     def test_business_planning_routes_require_auth(self):
         for method, path in (
             ("get", "/ideas"),

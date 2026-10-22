@@ -27,16 +27,21 @@ class ConnectionManager:
                 del self.active_connections[user_id]
     
     async def send_personal_message(self, message: dict, user_id: int):
+        delivered = 0
         if user_id in self.active_connections:
-            for connection in self.active_connections[user_id]:
+            for connection in list(self.active_connections[user_id]):
                 try:
                     await connection.send_json(message)
-                except:
-                    pass
+                    delivered += 1
+                except Exception:
+                    self.disconnect(connection, user_id)
+        return delivered
     
     async def broadcast(self, message: dict):
-        for user_id in self.active_connections:
-            await self.send_personal_message(message, user_id)
+        delivered = 0
+        for user_id in list(self.active_connections):
+            delivered += await self.send_personal_message(message, user_id)
+        return delivered
 
 
 ws_manager = ConnectionManager()
@@ -50,7 +55,7 @@ def send_notifications(payload: dict):
     
     if not recipients or not settings.smtp_host:
         print("NOTIFY (log only):", json.dumps(payload, default=str))
-        return
+        return False
     
     try:
         msg = EmailMessage()
@@ -65,8 +70,10 @@ def send_notifications(payload: dict):
             if settings.smtp_user and settings.smtp_password:
                 server.login(settings.smtp_user, settings.smtp_password)
             server.send_message(msg)
+        return True
     except Exception as exc:
         print("NOTIFY send failed, fallback log:", exc, payload)
+        return False
 
 
 async def notify_new_order(order_data: dict, user_id: int = None):
