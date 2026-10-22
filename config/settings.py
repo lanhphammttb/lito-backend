@@ -5,13 +5,21 @@ from typing import List, Optional
 from pydantic import BaseModel, ConfigDict
 
 # Load environment variables from .env file
-load_dotenv(os.path.join(os.path.dirname(__file__), "../.env"))
+if not os.getenv("VERCEL"):
+    load_dotenv(os.path.join(os.path.dirname(__file__), "../.env"))
 
 # Environment variables
 JWT_SECRET = os.getenv("JWT_SECRET")
 JWT_ALGO = "HS256"
 USE_MONGO = os.getenv("USE_MONGO", "false").lower() == "true"
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./hala.db")
+DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("POSTGRES_URL")
+if os.getenv("VERCEL") and not DATABASE_URL:
+    raise RuntimeError("Configure DATABASE_URL using a Vercel Postgres integration.")
+DATABASE_URL = DATABASE_URL or "sqlite:///./hala.db"
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+if os.getenv("VERCEL") and not DATABASE_URL.startswith("postgresql"):
+    raise RuntimeError("Vercel requires a persistent PostgreSQL database.")
 CORS_ORIGINS = [
     origin.strip()
     for origin in os.getenv(
@@ -44,8 +52,8 @@ class Settings(BaseModel):
     profit_share_mode: str = "50-50"
     share_user_a: float = 50.0
     share_user_b: float = 50.0
-    business_name: Optional[str] = "Hala Handmade"
-    shop_name: Optional[str] = "Hala Handmade"
+    business_name: Optional[str] = "LITO Handmade"
+    shop_name: Optional[str] = "LITO Handmade"
     currency: str = "VND"
     business_address: Optional[str] = None
     business_logo: Optional[str] = None

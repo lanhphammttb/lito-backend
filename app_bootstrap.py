@@ -400,6 +400,14 @@ def init_services():
 
 def load_data_from_sql():
     """Load data from SQL database into memory."""
+    for store in (
+        products, materials, orders, customers, categories, tasks, users,
+        seasons, suppliers, purchase_orders, stock_movements, payments,
+        issues, activity_logs, audit_logs, sent_notifications, content_plans,
+        demand_signals, experiments, goals, product_images, product_reviews,
+        product_bundles, production_jobs,
+    ):
+        store.clear()
     with Session(engine) as session:
         # Products
         from models.product import MaterialUsage
@@ -763,7 +771,7 @@ def load_data_from_sql():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
-    print("🚀 Starting Hala Handmade Business OS...")
+    print("🚀 Starting LITO Handmade Business OS...")
     auto_init_db = os.getenv("AUTO_INIT_DB_ON_STARTUP", "false").lower() == "true"
     auto_seed_data = os.getenv("AUTO_SEED_DATA_ON_STARTUP", "false").lower() == "true"
 
@@ -774,7 +782,8 @@ async def lifespan(app: FastAPI):
         else:
             print("ℹ Skipping automatic DB init/migrations on startup.")
 
-        seed_default_users()
+        if not os.getenv("VERCEL"):
+            seed_default_users()
         if auto_seed_data:
             seed_default_data()
         else:

@@ -1,4 +1,4 @@
-# Hala Handmade Business OS - Backend
+# LITO Handmade Business OS - Backend
 
 ## 📁 Project Structure
 

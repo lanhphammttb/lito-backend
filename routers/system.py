@@ -98,10 +98,18 @@ async def websocket_endpoint(websocket: WebSocket):
 @router.get("/health")
 async def health_check():
     """Health check."""
-    return {"status": "healthy", "timestamp": utcnow().isoformat(), "version": "2.0.0"}
+    from sqlalchemy import text
+    from starlette.concurrency import run_in_threadpool
+
+    def check_database():
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+
+    await run_in_threadpool(check_database)
+    return {"status": "healthy", "database": engine.dialect.name, "timestamp": utcnow().isoformat(), "version": "2.0.0"}
 
 
-@router.get("")
+@router.get("/")
 async def root():
     """Root endpoint."""
-    return {"name": "Hala Handmade Business OS", "version": "2.0.0", "docs": "/docs"}
+    return {"name": "LITO Handmade Business OS", "version": "2.0.0", "docs": "/docs"}

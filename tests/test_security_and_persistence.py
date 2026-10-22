@@ -55,6 +55,17 @@ class SecurityAndPersistenceTests(unittest.TestCase):
         response = self.client.get("/products")
         self.assertEqual(response.status_code, 401)
 
+    def test_frontend_system_routes_and_database_health(self):
+        for path in ("/alerts", "/users", "/issue-templates"):
+            with self.subTest(path=path):
+                self.assertEqual(self.client.get(path).status_code, 401)
+                response = self.client.get(path, headers=self.auth_headers)
+                self.assertEqual(response.status_code, 200, response.text)
+        for path in ("/health", "/system/health"):
+            response = self.client.get(path)
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["database"], "sqlite")
+
     def test_settings_requires_auth(self):
         response = self.client.get("/settings")
         self.assertEqual(response.status_code, 401)

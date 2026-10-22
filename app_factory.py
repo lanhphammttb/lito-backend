@@ -47,7 +47,7 @@ from routers.tasks import router as tasks_router
 from routers.upload import router as upload_router
 
 
-APP_TITLE = "Hala Handmade Business OS"
+APP_TITLE = "LITO Handmade Business OS"
 APP_DESCRIPTION = "Complete business management system for handmade businesses"
 APP_VERSION = "2.0.0"
 
@@ -102,6 +102,7 @@ def include_routers(app: FastAPI) -> None:
     app.include_router(marketplace_router, prefix="/marketplace", tags=["Marketplace"])
     app.include_router(notifications_router, prefix="/notifications", tags=["Notifications"])
     app.include_router(system_router, prefix="/system", tags=["System"])
+    app.include_router(system_router, tags=["System Compatibility"])
     app.add_api_websocket_route("/ws", websocket_endpoint)
 
 
@@ -123,6 +124,10 @@ def create_app(lifespan: Callable[[FastAPI], AbstractAsyncContextManager[None]])
         allow_headers=["*"],
     )
     include_routers(app)
+
+    if os.getenv("VERCEL"):
+        from serverless_state import ServerlessStateMiddleware
+        app.add_middleware(ServerlessStateMiddleware)
 
     @app.exception_handler(Exception)
     async def global_exception_handler(request, exc):

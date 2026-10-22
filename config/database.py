@@ -3,12 +3,16 @@ import os
 from typing import Generator, Optional
 from sqlmodel import SQLModel, Session, create_engine
 from contextlib import contextmanager
+from sqlalchemy.pool import NullPool
 
 from .settings import DATABASE_URL, USE_MONGO
 
 # Create engine
-connect_args = {"check_same_thread": False} if "sqlite" in DATABASE_URL else {}
-engine = create_engine(DATABASE_URL, connect_args=connect_args, echo=False, pool_pre_ping=True)
+connect_args = {"check_same_thread": False} if "sqlite" in DATABASE_URL else {"connect_timeout": 10}
+engine = create_engine(
+    DATABASE_URL, connect_args=connect_args, echo=False, pool_pre_ping=True,
+    **({"poolclass": NullPool} if os.getenv("VERCEL") else {}),
+)
 
 
 # MongoDB connection (optional)
