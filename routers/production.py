@@ -9,7 +9,8 @@ from sqlmodel import Session
 from config.database import engine
 from models.user import User
 from models.production import ProductionJob, ProductionJobTable, ProductionMaterial
-from schemas.production import ProductionJobCreate, ProductionJobStatusUpdate, ProductionJobUpdate
+from schemas.production import ProductionJobCreate, ProductionJobStatusUpdate, ProductionJobUpdate, ConsumptionAdjustment
+from services.production_consumption import consumption_revision, consumption_response, correct_consumption
 from services.auth import get_current_user
 from services.order import find_order
 from services.product import find_product
@@ -110,6 +111,7 @@ async def list_production_jobs(
         output = []
         for r in results:
             d = r.model_dump()
+            d['consumption_revision'] = consumption_revision(r)
             try:
                 d['materials'] = json.loads(d.get('materials_json', '[]') or '[]')
             except:
@@ -180,6 +182,43 @@ async def create_production_job(
         from services.stock_ledger import release_legacy_order_reservations
         release_legacy_order_reservations(order.id, user.id)
     return job
+
+
+@router.get('/{job_id}')
+async def production_job_detail(job_id: int, user: User = Depends(get_current_user)):
+    with Session(engine) as session:
+        row = session.get(ProductionJobTable, job_id)
+        if not row:
+            raise HTTPException(404, 'Lệnh sản xuất không tồn tại')
+        return consumption_response(row)
+
+
+@router.post('/{job_id}/consumption-adjustments')
+async def adjust_consumption(job_id: int, payload: ConsumptionAdjustment, user: User = Depends(get_current_user)):
+    from services.auth import require_admin
+    require_admin(user)
+    with Session(engine) as session:
+        row = session.exec(select(ProductionJobTable).where(ProductionJobTable.id == job_id).with_for_update()).first()
+        if not row:
+            raise HTTPException(404, 'Lệnh sản xuất không tồn tại')
+        result = correct_consumption(session, row, payload, user)
+        session.commit()
+    from services.product import clear_product_cost_cache
+    clear_product_cost_cache()
+    return result
+
+
+@router.get('/{job_id}/consumption-adjustments')
+async def consumption_history(job_id: int, user: User = Depends(get_current_user)):
+    from models.activity import AuditLogTable
+    with Session(engine) as session:
+        if not session.get(ProductionJobTable, job_id):
+            raise HTTPException(404, 'Lệnh sản xuất không tồn tại')
+        entries = session.exec(select(AuditLogTable).where(AuditLogTable.table_name == 'production_jobs',
+            AuditLogTable.record_id == job_id, AuditLogTable.action == 'ADJUST_CONSUMPTION')
+            .order_by(AuditLogTable.id.desc()).limit(100)).all()
+        return [{'id': entry.id, 'user_name': entry.user_name, 'timestamp': entry.timestamp,
+                 **json.loads(entry.after_data or '{}')} for entry in entries]
 
 
 def _load_job(row):

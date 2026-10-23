@@ -1,7 +1,7 @@
 """Production job schemas."""
 from typing import Optional, List
 from datetime import datetime
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from models.product import MaterialUsage
 
 
@@ -41,3 +41,35 @@ class ProductionJobUpdate(BaseModel):
     notes: Optional[str] = None
     due_at: Optional[datetime] = None
     materials: Optional[List[JobMaterialSelection]] = None
+
+
+class ConsumptionLineUpdate(BaseModel):
+    material_index: int = Field(ge=0)
+    material_id: int
+    actual_quantity: float = Field(ge=0, allow_inf_nan=False)
+
+    @field_validator('actual_quantity')
+    @classmethod
+    def supported_precision(cls, value):
+        if abs(value - round(value, 4)) > 1e-8:
+            raise ValueError('Lượng tiêu hao chỉ hỗ trợ tối đa 4 chữ số thập phân')
+        return round(value, 4)
+
+
+class ConsumptionAdjustment(BaseModel):
+    revision: str = Field(min_length=64, max_length=64)
+    reason: str = Field(min_length=1, max_length=1000)
+    materials: List[ConsumptionLineUpdate] = Field(min_length=1)
+
+    @field_validator('reason')
+    @classmethod
+    def nonblank_reason(cls, value):
+        if not value.strip():
+            raise ValueError('Nhập lý do điều chỉnh')
+        return value.strip()
+
+    @model_validator(mode='after')
+    def unique_rows(self):
+        if len({row.material_index for row in self.materials}) != len(self.materials):
+            raise ValueError('Mỗi dòng nguyên liệu chỉ được gửi một lần')
+        return self

@@ -942,6 +942,129 @@ class SecurityAndPersistenceTests(unittest.TestCase):
         summary = self.catalog_request("get", "/inventory/summary")
         self.assertEqual(next(r for r in summary["materials"] if r["id"] == m["id"])["stock_quantity"], 37)
 
+    def completed_consumption_fixture(self, code='correct-consumption', usages=None):
+        mat = self.make_material(code, 100)
+        product = self.catalog_request('post', '/products', {'name': code, 'time_minutes': 0,
+            'materials': usages or [{'material_id': mat['id'], 'quantity': 10}]})
+        job = self.catalog_request('post', '/production-jobs', {'product_id': product['id'], 'quantity': 2})
+        self.catalog_request('patch', f"/production-jobs/{job['id']}/status", {'status': 'completed'})
+        job = self.catalog_request('get', f"/production-jobs/{job['id']}")
+        return mat, product, job
+
+    def consumption_correction(self, job, quantities, reason='Ghi nhầm lượng tiêu hao', status=200):
+        return self.catalog_request('post', f"/production-jobs/{job['id']}/consumption-adjustments", {
+            'revision': job['consumption_revision'], 'reason': reason,
+            'materials': [{'material_index': index, 'material_id': row['material_id'], 'actual_quantity': quantities[index]}
+                          for index, row in enumerate(job['materials'])]}, status=status)
+
+    def test_consumption_correction_returns_only_difference_and_keeps_finished_and_price(self):
+        from sqlmodel import Session, select
+        from config.database import engine
+        from models.material import MaterialBatchTable
+        mat, product, job = self.completed_consumption_fixture()
+        self.catalog_request('put', f"/materials/{mat['id']}", {'name': mat['name'], 'code': mat['code'], 'unit_price': 99})
+        corrected = self.consumption_correction(job, [12])
+        self.assertEqual(corrected['materials'][0]['actual_quantity'], 12)
+        self.assertEqual(corrected['materials'][0]['unit_price'], job['materials'][0]['unit_price'])
+        self.assertEqual(self.catalog_request('get', f"/materials/{mat['id']}")['stock_quantity'], 88)
+        self.assertEqual(self.catalog_request('get', f"/products/{product['id']}")['finished_qty'], 2)
+        self.assertEqual(corrected['status'], 'completed')
+        history = self.catalog_request('get', f"/production-jobs/{job['id']}/consumption-adjustments")
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]['changes'][0]['stock_change'], 8)
+        self.assertEqual(history[0]['changes'][0]['previous_quantity'], 20)
+        self.assertEqual(history[0]['reason'], 'Ghi nhầm lượng tiêu hao')
+        with Session(engine) as session:
+            returned = session.exec(select(MaterialBatchTable).where(MaterialBatchTable.material_id == mat['id'])).all()
+            self.assertEqual(sum(row.quantity_remaining for row in returned), 8)
+        # A lost HTTP response and retry do not return stock twice or duplicate history.
+        self.consumption_correction(job, [12])
+        self.assertEqual(self.catalog_request('get', f"/materials/{mat['id']}")['stock_quantity'], 88)
+        self.assertEqual(len(self.catalog_request('get', f"/production-jobs/{job['id']}/consumption-adjustments")), 1)
+        self.consumption_correction(job, [11], status=409)
+        corrected = self.consumption_correction(corrected, [25])
+        self.assertEqual(self.catalog_request('get', f"/materials/{mat['id']}")['stock_quantity'], 75)
+        corrected = self.consumption_correction(corrected, [0])
+        self.assertEqual(corrected['materials'][0]['actual_quantity'], 0)
+        self.assertEqual(self.catalog_request('get', f"/materials/{mat['id']}")['stock_quantity'], 100)
+        self.assertEqual(self.catalog_request('get', f"/products/{product['id']}")['finished_qty'], 2)
+        self.catalog_request('delete', f"/production-jobs/{job['id']}", status=409)
+
+    def test_consumption_correction_batches_and_reservations_reconcile(self):
+        from sqlmodel import Session, select
+        from config.database import engine
+        from models.material import MaterialBatchTable
+        from datetime import date
+        mat = self.make_material('correction-batches', 100)
+        with Session(engine) as session:
+            batch = MaterialBatchTable(material_id=mat['id'], batch_code='ORIGINAL-QA',
+                quantity_received=100, quantity_remaining=100, unit_cost=2, received_date=date(2000, 1, 1))
+            session.add(batch)
+            session.commit()
+        product = self.catalog_request('post', '/products', {'name': 'Batch correction', 'materials': [{'material_id': mat['id'], 'quantity': 10}]})
+        job = self.catalog_request('post', '/production-jobs', {'product_id': product['id'], 'quantity': 2})
+        self.catalog_request('patch', f"/production-jobs/{job['id']}/status", {'status': 'in_progress'})
+        job = self.catalog_request('get', f"/production-jobs/{job['id']}")
+        other = self.catalog_request('post', '/production-jobs', {'product_id': product['id'], 'quantity': 7})
+        self.catalog_request('patch', f"/production-jobs/{other['id']}/status", {'status': 'reserved'})
+        self.consumption_correction(job, [35], status=409)
+        current = self.catalog_request('get', f"/materials/{mat['id']}")
+        self.assertEqual((current['stock_quantity'], current['reserved_qty']), (80, 70))
+        corrected = self.consumption_correction(job, [12])
+        corrected = self.consumption_correction(corrected, [25])
+        current = self.catalog_request('get', f"/materials/{mat['id']}")
+        self.assertEqual((current['stock_quantity'], current['reserved_qty'], current['available_qty']), (75, 70, 5))
+        with Session(engine) as session:
+            batches = session.exec(select(MaterialBatchTable).where(MaterialBatchTable.material_id == mat['id'])).all()
+            self.assertEqual(sum(row.quantity_remaining for row in batches), 75)
+            original = next(row for row in batches if row.batch_code == 'ORIGINAL-QA')
+            self.assertEqual(original.quantity_remaining, 67)
+        self.catalog_request('patch', f"/production-jobs/{job['id']}/status", {'status': 'completed'})
+        self.assertEqual(self.catalog_request('get', f"/materials/{mat['id']}")['stock_quantity'], 75)
+
+    def test_consumption_correction_aggregates_repeated_material_and_rolls_back(self):
+        first, second = self.make_material('correction-first', 100), self.make_material('correction-second', 5)
+        product = self.catalog_request('post', '/products', {'name': 'Correction rollback', 'materials': [
+            {'material_id': first['id'], 'quantity': 2}, {'material_id': first['id'], 'quantity': 3},
+            {'material_id': second['id'], 'quantity': 1}]})
+        job = self.catalog_request('post', '/production-jobs', {'product_id': product['id']})
+        self.catalog_request('patch', f"/production-jobs/{job['id']}/status", {'status': 'completed'})
+        job = self.catalog_request('get', f"/production-jobs/{job['id']}")
+        self.consumption_correction(job, [60, 60, 1], status=409)
+        self.consumption_correction(job, [0, 0, 100], status=409)
+        self.assertEqual(self.catalog_request('get', f"/materials/{first['id']}")['stock_quantity'], 95)
+        self.assertEqual(self.catalog_request('get', f"/materials/{second['id']}")['stock_quantity'], 4)
+        self.assertEqual(self.catalog_request('get', f"/production-jobs/{job['id']}")['consumption_revision'], job['consumption_revision'])
+        self.assertEqual(self.catalog_request('get', f"/production-jobs/{job['id']}/consumption-adjustments"), [])
+        result = self.consumption_correction(job, [0, 7, 1])
+        self.assertEqual([row['actual_quantity'] for row in result['materials']], [0, 7, 1])
+        self.assertEqual(self.catalog_request('get', f"/materials/{first['id']}")['stock_quantity'], 93)
+
+    def test_consumption_correction_validates_state_units_input_and_permissions(self):
+        mat, product, job = self.completed_consumption_fixture('correction-input')
+        for quantity in (-1, 1.00001):
+            self.consumption_correction(job, [quantity], status=422)
+        self.consumption_correction(job, [12], reason='   ', status=422)
+        path = f"/production-jobs/{job['id']}/consumption-adjustments"
+        body = {'revision': job['consumption_revision'], 'reason': 'QA', 'materials': [
+            {'material_index': 0, 'material_id': mat['id'], 'actual_quantity': 12}]}
+        self.assertEqual(self.client.post(path, json=body).status_code, 401)
+        self.assertEqual(self.client.get(path).status_code, 401)
+        viewer = self.client.post('/auth/register', json={'email': 'consumption-viewer@example.com', 'password': 'viewer-password'}).json()
+        self.assertEqual(self.client.post(path, json=body, headers={'Authorization': 'Bearer ' + viewer['access_token']}).status_code, 403)
+        duplicate = {**body, 'materials': body['materials'] * 2}
+        self.catalog_request('post', path, duplicate, status=422)
+        pending = self.catalog_request('post', '/production-jobs', {'product_id': product['id']})
+        pending = self.catalog_request('get', f"/production-jobs/{pending['id']}")
+        self.consumption_correction(pending, [5], status=409)
+        piece = self.make_material('correction-piece', 100)
+        self.catalog_request('put', f"/materials/{piece['id']}", {'name': piece['name'], 'code': piece['code'], 'unit_type': 'piece', 'unit': 'cái'})
+        product = self.catalog_request('post', '/products', {'name': 'Piece correction', 'materials': [{'material_id': piece['id'], 'quantity': 1}]})
+        job = self.catalog_request('post', '/production-jobs', {'product_id': product['id']})
+        self.catalog_request('patch', f"/production-jobs/{job['id']}/status", {'status': 'completed'})
+        job = self.catalog_request('get', f"/production-jobs/{job['id']}")
+        self.consumption_correction(job, [0.5], status=422)
+
     def test_job_uses_selected_material_snapshot_and_consumes_once(self):
         primary = self.make_material("primary-blue")
         actual = self.make_material("other-brand-blue")
