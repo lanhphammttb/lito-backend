@@ -1065,6 +1065,93 @@ class SecurityAndPersistenceTests(unittest.TestCase):
         job = self.catalog_request('get', f"/production-jobs/{job['id']}")
         self.consumption_correction(job, [0.5], status=422)
 
+    def replace_consumption(self, job, edits, status=200):
+        return self.catalog_request('post', f"/production-jobs/{job['id']}/consumption-adjustments", {
+            'revision': job['consumption_revision'], 'reason': 'Ghi sai loại nguyên liệu thực tế',
+            'materials': [{'material_index': index, 'material_id': job['materials'][index]['material_id'],
+                          'replacement_material_id': mid, 'actual_quantity': quantity} for index, mid, quantity in edits]}, status=status)
+
+    def test_consumption_replacement_returns_old_and_consumes_new_without_changing_finished(self):
+        old, product, job = self.completed_consumption_fixture('replacement-old')
+        new = self.make_material('replacement-new', 100)
+        self.catalog_request('put', f"/materials/{new['id']}", {'name': new['name'], 'code': new['code'], 'unit_price': 3})
+        result = self.replace_consumption(job, [(0, new['id'], 7)])
+        actual = result['materials'][0]
+        self.assertEqual((actual['material_id'], actual['actual_quantity'], actual['unit_price']), (new['id'], 7, 3))
+        self.assertEqual(actual['unit_price_basis'], 'correction_current_price')
+        self.assertEqual((actual['planned_material_id'], actual['planned_quantity'], actual['quantity_per_product']), (old['id'], 20, 10))
+        self.assertEqual(self.catalog_request('get', f"/materials/{old['id']}")['stock_quantity'], 100)
+        self.assertEqual(self.catalog_request('get', f"/materials/{new['id']}")['stock_quantity'], 93)
+        self.assertEqual(self.catalog_request('get', f"/products/{product['id']}")['finished_qty'], 2)
+        self.assertEqual(result['status'], 'completed')
+        self.replace_consumption(job, [(0, new['id'], 7)])
+        history = self.catalog_request('get', f"/production-jobs/{job['id']}/consumption-adjustments")
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]['replacements'][0]['previous_material_id'], old['id'])
+        self.assertEqual([(c['material_id'], c['stock_change']) for c in history[0]['changes']], [(old['id'], 20), (new['id'], -7)])
+        self.assertEqual(self.catalog_request('get', f"/materials/{new['id']}")['stock_quantity'], 93)
+        self.replace_consumption(job, [(0, old['id'], 8)], status=409)
+        restored = self.replace_consumption(result, [(0, old['id'], 8)])
+        self.assertEqual(restored['materials'][0]['planned_material_id'], old['id'])
+        self.assertEqual(self.catalog_request('get', f"/materials/{new['id']}")['stock_quantity'], 100)
+        self.assertEqual(self.catalog_request('get', f"/materials/{old['id']}")['stock_quantity'], 92)
+
+    def test_consumption_replacement_shortage_rolls_back_and_uses_new_unit(self):
+        old, product, job = self.completed_consumption_fixture('replacement-atomic-old')
+        new = self.make_material('replacement-piece', 1)
+        self.catalog_request('put', f"/materials/{new['id']}", {'name': new['name'], 'code': new['code'], 'unit_type': 'piece', 'unit': 'cái'})
+        self.replace_consumption(job, [(0, new['id'], 2)], status=409)
+        self.replace_consumption(job, [(0, new['id'], 0.5)], status=422)
+        self.replace_consumption(job, [(0, 999999, 1)], status=409)
+        self.assertEqual(self.catalog_request('get', f"/materials/{old['id']}")['stock_quantity'], 80)
+        self.assertEqual(self.catalog_request('get', f"/production-jobs/{job['id']}/consumption-adjustments"), [])
+        result = self.replace_consumption(job, [(0, new['id'], 1)])
+        self.assertEqual((result['materials'][0]['unit'], result['materials'][0]['unit_type']), ('cái', 'piece'))
+        self.assertEqual(result['materials'][0]['planned_unit'], old['unit'])
+        self.assertEqual(self.catalog_request('get', f"/materials/{old['id']}")['stock_quantity'], 100)
+
+    def test_consumption_replacement_aggregates_shared_targets_and_supports_atomic_swap(self):
+        first, second, target = [self.make_material(f'replacement-swap-{index}', 10) for index in range(3)]
+        product = self.catalog_request('post', '/products', {'name': 'Replacement swap', 'materials': [
+            {'material_id': first['id'], 'quantity': 10}, {'material_id': second['id'], 'quantity': 10}]})
+        job = self.catalog_request('post', '/production-jobs', {'product_id': product['id']})
+        self.catalog_request('patch', f"/production-jobs/{job['id']}/status", {'status': 'completed'})
+        job = self.catalog_request('get', f"/production-jobs/{job['id']}")
+        self.replace_consumption(job, [(0, target['id'], 6), (1, target['id'], 6)], status=409)
+        self.assertEqual(self.catalog_request('get', f"/materials/{first['id']}")['stock_quantity'], 0)
+        self.assertEqual(self.catalog_request('get', f"/materials/{target['id']}")['stock_quantity'], 10)
+        swapped = self.replace_consumption(job, [(0, second['id'], 10), (1, first['id'], 10)])
+        self.assertEqual([row['material_id'] for row in swapped['materials']], [second['id'], first['id']])
+        self.assertEqual([self.catalog_request('get', f"/materials/{m['id']}")['stock_quantity'] for m in (first, second)], [0, 0])
+
+    def test_consumption_replacement_zero_quantity_keeps_audit_and_progress_does_not_reconsume(self):
+        old, product, job = self.completed_consumption_fixture('replacement-zero-old')
+        other = self.make_material('replacement-zero-new', 100)
+        zero = self.consumption_correction(job, [0])
+        # Older completed jobs can lack a start timestamp; a zero correction must
+        # not permanently prevent another correction to the completed record.
+        from sqlmodel import Session
+        from config.database import engine
+        from models.production import ProductionJobTable
+        with Session(engine) as session:
+            legacy = session.get(ProductionJobTable, job['id'])
+            legacy.started_at = None
+            session.add(legacy)
+            session.commit()
+        result = self.replace_consumption(zero, [(0, other['id'], 0)])
+        history = self.catalog_request('get', f"/production-jobs/{job['id']}/consumption-adjustments")
+        self.assertEqual(history[0]['replacements'][0]['material_id'], other['id'])
+        self.assertEqual(history[0]['materials'][0]['material_id'], other['id'])
+        self.replace_consumption(zero, [(0, other['id'], 0)])
+        self.assertEqual(len(self.catalog_request('get', f"/production-jobs/{job['id']}/consumption-adjustments")), len(history))
+        running = self.catalog_request('post', '/production-jobs', {'product_id': product['id']})
+        self.catalog_request('patch', f"/production-jobs/{running['id']}/status", {'status': 'in_progress'})
+        running = self.catalog_request('get', f"/production-jobs/{running['id']}")
+        self.replace_consumption(running, [(0, other['id'], 5)])
+        self.catalog_request('patch', f"/production-jobs/{running['id']}/status", {'status': 'completed'})
+        self.assertEqual(self.catalog_request('get', f"/materials/{other['id']}")['stock_quantity'], 95)
+        self.assertEqual(self.catalog_request('get', f"/products/{product['id']}")['finished_qty'], 3)
+
     def test_job_uses_selected_material_snapshot_and_consumes_once(self):
         primary = self.make_material("primary-blue")
         actual = self.make_material("other-brand-blue")

@@ -18,6 +18,11 @@ class ProductionMaterial(BaseModel):
     unit: Optional[str] = None
     unit_type: Optional[str] = None
     unit_price: Optional[float] = None
+    unit_price_basis: Optional[str] = None
+    planned_material_id: Optional[int] = None
+    planned_material_name: Optional[str] = None
+    planned_unit: Optional[str] = None
+    planned_unit_type: Optional[str] = None
     bom_line_index: Optional[int] = None
     bom_material_id: Optional[int] = None
     alternative_material_ids: List[int] = Field(default_factory=list)

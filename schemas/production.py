@@ -46,6 +46,7 @@ class ProductionJobUpdate(BaseModel):
 class ConsumptionLineUpdate(BaseModel):
     material_index: int = Field(ge=0)
     material_id: int
+    replacement_material_id: Optional[int] = Field(default=None, gt=0)
     actual_quantity: float = Field(ge=0, allow_inf_nan=False)
 
     @field_validator('actual_quantity')
